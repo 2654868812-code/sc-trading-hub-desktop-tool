@@ -1,7 +1,7 @@
 """
 泛天贸易中心 - 数据上传工具
 参考 sc-trade-companion / SC-Datarunner-UEX
-用法: python main.py  (需先启动 OCR 服务: cd ../ocr-service && python server.py)
+用法: python main.py
 
 快捷键: F3 = 截图并识别
 """
@@ -10,7 +10,8 @@ import sys
 import time
 import threading
 import tempfile
-import keyboard as kb
+import ctypes
+from ctypes import wintypes
 from PIL import ImageGrab
 
 import requests
@@ -25,13 +26,20 @@ from PyQt6.QtGui import QPixmap, QImage, QDragEnterEvent, QDropEvent, QFont, QPa
 
 # ════════════════ 配置 ════════════════
 API_BASE = os.environ.get("FT_API", "http://localhost:4000")
-OCR_URL = os.environ.get("FT_OCR", "http://127.0.0.1:8765/parse")
 
-# Star Citizen 截图路径
-SC_DIRS = [
-    os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Roberts Space Industries", "StarCitizen", "LIVE", "ScreenShots"),
-    os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Roberts Space Industries", "StarCitizen", "LIVE", "ScreenShots"),
-]
+# ════════════════ 内嵌 OCR（直接引用 ocr-service 模块） ════════════════
+_ocr_service_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "sc-trading-hub", "ocr-service")
+if _ocr_service_dir not in sys.path:
+    sys.path.insert(0, _ocr_service_dir)
+from server import run_ocr, parse_kiosk, get_ocr  # CnOCR, lazy-load on first call
+
+def _preload_ocr():
+    """Preload OCR model in background thread so first F3 is fast."""
+    try:
+        get_ocr()  # trigger model loading
+    except:
+        pass
 
 
 # ════════════════ OCR Worker ════════════════
@@ -46,8 +54,10 @@ class OcrWorker(QThread):
     def run(self):
         try:
             with open(self.file_path, "rb") as f:
-                resp = requests.post(OCR_URL, files={"file": f}, timeout=60)
-            self.finished.emit(resp.json())
+                img_bytes = f.read()
+            lines, img_h = run_ocr(img_bytes)
+            result = parse_kiosk(lines, img_h)
+            self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -68,36 +78,6 @@ class SubmitWorker(QThread):
             self.error.emit(str(e))
 
 
-# ════════════════ 文件监控线程 ════════════════
-class ScreenshotWatcher(QThread):
-    new_file = pyqtSignal(str)
-
-    def __init__(self, watch_dir: str):
-        super().__init__()
-        self.watch_dir = watch_dir
-        self.running = True
-
-    def run(self):
-        if not os.path.isdir(self.watch_dir):
-            return
-        seen = set(os.listdir(self.watch_dir))
-        while self.running:
-            try:
-                current = set(os.listdir(self.watch_dir))
-                for f in sorted(current - seen):
-                    fpath = os.path.join(self.watch_dir, f)
-                    time.sleep(0.3)
-                    if os.path.isfile(fpath):
-                        self.new_file.emit(fpath)
-                seen = current
-            except:
-                pass
-            time.sleep(2)
-
-    def stop(self):
-        self.running = False
-
-
 # ════════════════ 主窗口 ════════════════
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -106,46 +86,48 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(900, 600)
         self.setAcceptDrops(True)
 
-        # 暗色主题
+        # 泛天贸易中心配色 — 与网站保持一致
         self.setStyleSheet("""
-            QMainWindow, QWidget#central { background: #1a1a2e; }
-            QLabel { color: #ccc; font-size: 13px; }
-            QLabel#title { color: #fff; font-size: 14px; font-weight: bold; }
+            QMainWindow, QWidget#central { background: #faf7f0; }
+            QLabel { color: #2d2318; font-size: 13px; }
+            QLabel#title { color: #2d2318; font-size: 13px; }
             QLineEdit, QComboBox {
-                background: #2a2a3e; color: #fff; border: 1px solid #444;
-                padding: 4px; border-radius: 3px; font-size: 12px;
+                background: #ffffff; color: #2d2318; border: 1px solid #e4dcc8;
+                padding: 4px 6px; border-radius: 4px; font-size: 12px;
             }
+            QLineEdit:focus, QComboBox:focus { border-color: #c9a94e; }
             QTableWidget {
-                background: #2a2a3e; color: #fff; gridline-color: #333;
-                border: 1px solid #333; font-size: 12px;
+                background: #ffffff; color: #2d2318; gridline-color: #f0ebe0;
+                border: 1px solid #e4dcc8; font-size: 12px;
+                border-radius: 4px;
             }
-            QTableWidget::item:selected { background: #4a90d9; }
+            QTableWidget::item:selected { background: #c9a94e; color: #fff; }
             QHeaderView::section {
-                background: #333; color: #ccc; padding: 4px;
-                border: none; font-size: 12px;
+                background: #f5f0e5; color: #2d2318; padding: 5px 4px;
+                border: none; border-bottom: 1px solid #e4dcc8; font-size: 12px; font-weight: bold;
             }
             QPushButton {
-                background: #4a90d9; color: #fff; border: none;
-                padding: 8px 20px; border-radius: 4px; font-size: 13px;
+                background: #ffffff; color: #2d2318; border: 1px solid #e4dcc8;
+                padding: 6px 16px; border-radius: 4px; font-size: 13px;
             }
-            QPushButton:hover { background: #5aa0e9; }
-            QPushButton:disabled { background: #444; color: #888; }
-            QPushButton#submitBtn { background: #27ae60; font-size: 14px; padding: 8px 30px; }
-            QPushButton#submitBtn:hover { background: #2ecc71; }
-            QStatusBar { background: #111; color: #888; }
+            QPushButton:hover { background: #f5f0e5; border-color: #c9a94e; }
+            QPushButton:disabled { background: #f0ebe0; color: #8a8070; border-color: #e4dcc8; }
+            QPushButton#submitBtn { background: #c9a94e; color: #ffffff; border: none; font-size: 14px; padding: 7px 28px; font-weight: bold; }
+            QPushButton#submitBtn:hover { background: #b8983d; }
+            QStatusBar { background: #faf7f0; color: #8a8070; border-top: 1px solid #e4dcc8; }
             QProgressBar {
-                border: none; background: #2a2a3e; height: 4px;
-                text-align: center; color: transparent;
+                border: none; background: #f0ebe0; height: 3px;
+                text-align: center; color: transparent; border-radius: 1px;
             }
-            QProgressBar::chunk { background: #4a90d9; }
-            QSplitter::handle { background: #333; width: 1px; }
+            QProgressBar::chunk { background: #c9a94e; border-radius: 1px; }
+            QSplitter::handle { background: #e4dcc8; width: 1px; }
             QFrame#dropZone {
-                border: 2px dashed #555; border-radius: 8px;
-                background: #14142a; min-height: 200px;
+                border: 2px dashed #e4dcc8; border-radius: 8px;
+                background: #ffffff; min-height: 200px;
             }
-            QFrame#dropZone:hover { border-color: #4a90d9; }
-            QCheckBox { color: #ccc; }
-            QCheckBox::indicator { width: 18px; height: 18px; }
+            QFrame#dropZone:hover { border-color: #c9a94e; background: #faf7f0; }
+            QCheckBox { color: #2d2318; }
+            QCheckBox::indicator { width: 16px; height: 16px; }
         """)
 
         central = QWidget(objectName="central")
@@ -154,8 +136,25 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
         layout.setContentsMargins(15, 10, 15, 10)
 
-        # 标题栏
-        self.title_label = QLabel("拖入截图或 Ctrl+V 粘贴  |  监控: 未找到截图文件夹")
+        # 标题
+        title_row = QHBoxLayout()
+        self.logo_label = QLabel("泛天")
+        self.logo_label.setStyleSheet("font-size: 22px; font-weight: bold; color: #c9a94e; font-family: serif;")
+        title_row.addWidget(self.logo_label)
+        self.subtitle_label = QLabel("数据上传工具")
+        self.subtitle_label.setStyleSheet("font-size: 11px; color: #8a8070; padding-top: 8px;")
+        title_row.addWidget(self.subtitle_label)
+        title_row.addStretch()
+        layout.addLayout(title_row)
+
+        # Gold shimmer line
+        gold_line = QFrame()
+        gold_line.setFixedHeight(2)
+        gold_line.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #c9a94e, stop:0.3 #d4b85e, stop:0.5 #c9a94e, stop:0.7 #d4b85e, stop:1 #c9a94e); border: none;")
+        layout.addWidget(gold_line)
+
+        # 提示文字
+        self.title_label = QLabel("拖入截图或 Ctrl+V 粘贴  |  F3 一键截图识别")
         self.title_label.setObjectName("title")
         layout.addWidget(self.title_label)
 
@@ -174,7 +173,7 @@ class MainWindow(QMainWindow):
         drop_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label = QLabel("拖入截图\n或 Ctrl+V 粘贴")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setStyleSheet("color: #666; font-size: 14px;")
+        self.preview_label.setStyleSheet("color: #8a8070; font-size: 14px;")
         drop_layout.addWidget(self.preview_label)
         splitter.addWidget(self.drop_zone)
 
@@ -194,6 +193,9 @@ class MainWindow(QMainWindow):
         # 表格
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["商品名", "库存等级", "SCU", "单价", "最大库存"])
+        # 货箱规格暂时禁用
+        # self.table = QTableWidget(0, 6)
+        # self.table.setHorizontalHeaderLabels(["商品名", "库存等级", "SCU", "单价", "最大库存", "货箱规格"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for i in range(1, 5):
@@ -221,13 +223,11 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status)
         self.status.showMessage("就绪")
 
-        # 快捷键 F3 = 截图识别
-        self.hotkey_thread = threading.Thread(target=self._hotkey_listener, daemon=True)
-        self.hotkey_thread.start()
+        # 窗口显示后注册全局热键（需要有效的窗口句柄）
+        QTimer.singleShot(200, self._register_hotkey)
 
-        # 文件夹监控
-        self.watcher = None
-        self._start_watcher()
+        # 预加载 OCR 模型（后台线程，GUI 无感）
+        threading.Thread(target=_preload_ocr, daemon=True).start()
 
         # 当前数据
         self.current_image = None
@@ -334,6 +334,16 @@ class MainWindow(QMainWindow):
             chk_layout.setContentsMargins(0, 0, 0, 0)
             self.table.setCellWidget(i, 4, chk_widget)
 
+            # 货箱规格 — 暂时禁用，精度不够
+            # box = item.get("boxSizes")
+            # if isinstance(box, list) and box:
+            #     box_text = " / ".join(str(b) for b in box)
+            # elif box:
+            #     box_text = str(box)
+            # else:
+            #     box_text = ""
+            # self.table.setItem(i, 5, QTableWidgetItem(box_text))
+
         self.submit_btn.setEnabled(True)
 
     def on_ocr_error(self, err_msg: str):
@@ -348,6 +358,7 @@ class MainWindow(QMainWindow):
 
         # 从表格读最新数据
         items = []
+        ocr_items = self.current_result.get("items", [])
         for i in range(self.table.rowCount()):
             name_widget = self.table.cellWidget(i, 0)
             inv_widget = self.table.cellWidget(i, 1)
@@ -367,6 +378,7 @@ class MainWindow(QMainWindow):
                 "scu": self._parse_int(self.table.item(i, 2)),
                 "price": self._parse_float(self.table.item(i, 3)),
                 "isMaxStock": is_max,
+                # "boxSizes": ocr_items[i].get("boxSizes") if i < len(ocr_items) else None,  # 暂时禁用
             })
 
         self.submit_btn.setEnabled(False)
@@ -408,30 +420,39 @@ class MainWindow(QMainWindow):
             return None
 
     # ── 文件夹监控 ────────────────────────
-    def _hotkey_listener(self):
-        """F3 截图并识别 (对标 sc-trade-companion)"""
-        def capture():
-            tmp = os.path.join(tempfile.gettempdir(), f"sc_f3_{int(time.time())}.png")
-            img = ImageGrab.grab()
-            img.save(tmp, "PNG")
-            # 必须主线程调 Qt
-            QTimer.singleShot(0, lambda: self.process_file(tmp))
-        try:
-            kb.add_hotkey("F3", capture)
-            kb.wait()
-        except:
-            pass  # 无管理员权限时热键不可用
-
-    def _start_watcher(self):
-        for d in SC_DIRS:
-            if os.path.isdir(d):
-                self.watcher = ScreenshotWatcher(d)
-                self.watcher.new_file.connect(self.process_file)
-                self.watcher.start()
-                self.title_label.setText(f"拖入截图或 Ctrl+V 粘贴  |  监控: {d}")
+    def _register_hotkey(self):
+        """Register global hotkey via Windows API. Try F3 first, fallback F4."""
+        self._hotkey_id = 1
+        hwnd = int(self.winId())
+        for vk, label in [(0x72, "F3"), (0x73, "F4")]:
+            ok = ctypes.windll.user32.RegisterHotKey(hwnd, self._hotkey_id, 0, vk)
+            if ok:
+                self.status.showMessage(f"热键 {label} 已就绪")
                 return
-        self.title_label.setText("拖入截图或 Ctrl+V 粘贴  |  未找到 SC 截图文件夹")
+        self.status.showMessage("热键注册失败，请用拖拽或 Ctrl+V")
 
+    def nativeEvent(self, eventType, message):
+        """Catch WM_HOTKEY (0x0312) from Windows."""
+        # message is a ctypes pointer to MSG struct
+        try:
+            ptr = int(message)
+            if ptr:
+                msg = ctypes.cast(ptr, ctypes.POINTER(wintypes.MSG)).contents
+                if msg.message == 0x0312:  # WM_HOTKEY
+                    self._on_f3()
+                    return True, 0
+        except:
+            pass
+        return False, 0
+
+    def _on_f3(self):
+        """F3: capture screen and OCR."""
+        tmp = os.path.join(tempfile.gettempdir(), f"sc_f3_{int(time.time())}.png")
+        ImageGrab.grab().save(tmp, "PNG")
+        self.process_file(tmp)
+
+    def closeEvent(self, event):
+        event.accept()
 
 # ════════════════ 入口 ════════════════
 def main():

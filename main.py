@@ -2,14 +2,16 @@
 泛天贸易中心 - 数据上传工具
 参考 sc-trade-companion / SC-Datarunner-UEX
 用法: python main.py  (需先启动 OCR 服务: cd ../ocr-service && python server.py)
+
+快捷键: F3 = 截图并识别
 """
-import json
 import os
 import sys
 import time
 import threading
-from pathlib import Path
-from io import BytesIO
+import tempfile
+import keyboard as kb
+from PIL import ImageGrab
 
 import requests
 from PyQt6.QtWidgets import (
@@ -219,6 +221,10 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status)
         self.status.showMessage("就绪")
 
+        # 快捷键 F3 = 截图识别
+        self.hotkey_thread = threading.Thread(target=self._hotkey_listener, daemon=True)
+        self.hotkey_thread.start()
+
         # 文件夹监控
         self.watcher = None
         self._start_watcher()
@@ -402,6 +408,20 @@ class MainWindow(QMainWindow):
             return None
 
     # ── 文件夹监控 ────────────────────────
+    def _hotkey_listener(self):
+        """F3 截图并识别 (对标 sc-trade-companion)"""
+        def capture():
+            tmp = os.path.join(tempfile.gettempdir(), f"sc_f3_{int(time.time())}.png")
+            img = ImageGrab.grab()
+            img.save(tmp, "PNG")
+            # 必须主线程调 Qt
+            QTimer.singleShot(0, lambda: self.process_file(tmp))
+        try:
+            kb.add_hotkey("F3", capture)
+            kb.wait()
+        except:
+            pass  # 无管理员权限时热键不可用
+
     def _start_watcher(self):
         for d in SC_DIRS:
             if os.path.isdir(d):

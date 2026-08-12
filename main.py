@@ -10,26 +10,92 @@ import sys
 import time
 import threading
 import tempfile
-import ctypes
-from ctypes import wintypes
-from PIL import ImageGrab
+import winsound
 
 import requests
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
-    QFileDialog, QSplitter, QStatusBar, QMessageBox, QComboBox,
-    QCheckBox, QLineEdit, QFrame, QStyle, QProgressBar
+    QSplitter, QStatusBar, QMessageBox, QComboBox,
+    QCheckBox, QLineEdit, QFrame, QProgressBar, QTabWidget
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QPixmap, QImage, QDragEnterEvent, QDropEvent, QFont, QPalette, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtGui import QPixmap, QFont
+
+# ════════════════ F3 Hotkey ════════════════
+# Anti-cheat safe (EAC/BattlEye compatible):
+# - keyboard: WH_KEYBOARD_LL hook (OS-level, same as Discord/OBS hotkeys)
+# - mss: desktop screenshot via BitBlt/DXGI (standard Windows API)
+# - NO DLL injection, NO memory reading, NO overlay, NO game process interaction
+# Admin elevation only needed for UIPI bypass when game runs elevated.
+#
+# sc-trade-companion uses same architecture (JNativeHook + Robot screenshot)
+# and has been verified working with EAC.
+
+import ctypes
+import mss
+
+# Auto-elevate: if not admin, relaunch as admin
+if not ctypes.windll.shell32.IsUserAnAdmin():
+    ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", sys.executable,
+        " ".join(f'"{a}"' if ' ' in a else a for a in sys.argv),
+        os.path.dirname(os.path.abspath(__file__)), 1)
+    sys.exit(0)
+
+import keyboard
+import json as _json
+
+# ════════════════ Config ════════════════
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ft_upload_config.json")
+
+def _load_config():
+    if os.path.exists(_CONFIG_PATH):
+        try:
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                return _json.load(f)
+        except:
+            pass
+    return {"hotkey": "f3"}
+
+def _save_config(cfg: dict):
+    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+        _json.dump(cfg, f, indent=2, ensure_ascii=False)
+
+_config = _load_config()
+_current_hotkey = _config.get("hotkey", "f3")
+
+_trigger_event = threading.Event()
+
+def _on_hotkey():
+    _trigger_event.set()
+
+def _register_hotkey(key: str):
+    """Register global hotkey via keyboard library. Returns True on success."""
+    global _current_hotkey
+    try:
+        keyboard.remove_all_hotkeys()
+    except:
+        pass
+    try:
+        keyboard.add_hotkey(key, _on_hotkey)
+        _current_hotkey = key
+        return True
+    except Exception:
+        return False
+
+_register_hotkey(_current_hotkey)
 
 # ════════════════ 配置 ════════════════
 API_BASE = os.environ.get("FT_API", "http://localhost:4000")
 
 # ════════════════ 内嵌 OCR（直接引用 ocr-service 模块） ════════════════
-_ocr_service_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                 "sc-trading-hub", "ocr-service")
+# PyInstaller bundles ocr-service as data; sys._MEIPASS is the temp extract dir
+if getattr(sys, 'frozen', False):
+    _ocr_service_dir = os.path.join(sys._MEIPASS, "ocr-service")
+else:
+    _ocr_service_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                     "sc-trading-hub", "ocr-service")
 if _ocr_service_dir not in sys.path:
     sys.path.insert(0, _ocr_service_dir)
 from server import run_ocr, parse_kiosk, get_ocr  # CnOCR, lazy-load on first call
@@ -78,13 +144,152 @@ class SubmitWorker(QThread):
             self.error.emit(str(e))
 
 
+# ════════════════ 设置窗口 ════════════════
+
+class HotkeyCaptureWidget(QLineEdit):
+    """Read-only line edit that captures next key press as hotkey binding."""
+    key_captured = pyqtSignal(str)
+
+    def __init__(self, current_key: str):
+        super().__init__(f"当前: {current_key.upper()}  —  点击后按下新快捷键")
+        self.setReadOnly(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("""
+            QLineEdit { background: #f5f0e5; border: 2px dashed #e4dcc8;
+                padding: 12px 24px; font-size: 16px; color: #8a8070;
+                border-radius: 4px; min-height: 50px; }
+            QLineEdit:focus { border-color: #c9a94e; background: #fff; color: #2d2318; }
+        """)
+        self._capturing = False
+
+    def mousePressEvent(self, event):
+        self._capturing = True
+        self.setText("按下快捷键...")
+        self.setStyleSheet("""
+            QLineEdit { background: #fff; border: 2px solid #c9a94e;
+                padding: 12px 24px; font-size: 16px; color: #c9a94e;
+                border-radius: 4px; min-height: 50px; }
+        """)
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        if not self._capturing:
+            return super().keyPressEvent(event)
+        parts = []
+        mods = event.modifiers()
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            parts.append("ctrl")
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("shift")
+        if mods & Qt.KeyboardModifier.AltModifier:
+            parts.append("alt")
+        key = event.key()
+        key_name = ""
+        if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F12:
+            key_name = f"f{key - Qt.Key.Key_F1 + 1}"
+        elif Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            key_name = chr(key).lower()
+        elif Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+            key_name = chr(key)
+        elif key == Qt.Key.Key_Space:
+            key_name = "space"
+        if key_name:
+            parts.append(key_name)
+        if parts and key_name:  # must have a non-modifier key
+            captured = "+".join(parts)
+            self._capturing = False
+            self.setText(f"已捕获: {captured.upper()}")
+            self.key_captured.emit(captured)
+            self.setStyleSheet("""
+                QLineEdit { background: #f5f0e5; border: 2px dashed #c9a94e;
+                    padding: 12px 24px; font-size: 16px; color: #2d2318;
+                    border-radius: 4px; min-height: 50px; }
+            """)
+        else:
+            self.setText("未识别的按键，请重试")
+
+
+class SettingsTab(QWidget):
+    """Settings tab embedded in main window."""
+    hotkey_changed = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("""
+            QWidget { background: #faf7f0; }
+            QLabel { color: #2d2318; font-size: 13px; }
+            QLabel#title { font-size: 18px; font-weight: bold; color: #c9a94e; font-family: serif; }
+            QPushButton { background: #ffffff; color: #2d2318; border: 1px solid #e4dcc8;
+                padding: 8px 20px; border-radius: 4px; font-size: 14px; }
+            QPushButton:hover { background: #f5f0e5; border-color: #c9a94e; }
+            QPushButton#saveBtn { background: #c9a94e; color: #fff; border: none;
+                font-weight: bold; padding: 8px 28px; }
+            QPushButton#saveBtn:hover { background: #b8983d; }
+        """)
+        self._captured_key = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(24, 20, 24, 20)
+
+        title = QLabel("偏好设置")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        layout.addSpacing(6)
+        layout.addWidget(QLabel("截图快捷键"))
+
+        self.capture_widget = HotkeyCaptureWidget(_current_hotkey)
+        self.capture_widget.key_captured.connect(self._on_key_captured)
+        layout.addWidget(self.capture_widget)
+
+        self.hint_label = QLabel("")
+        self.hint_label.setStyleSheet("color: #8a8070; font-size: 11px;")
+        layout.addWidget(self.hint_label)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton("取消")
+        cancel_btn.clicked.connect(self.close)
+        btn_row.addWidget(cancel_btn)
+        self.save_btn = QPushButton("保存")
+        self.save_btn.setObjectName("saveBtn")
+        self.save_btn.clicked.connect(self._save)
+        self.save_btn.setEnabled(False)
+        btn_row.addWidget(self.save_btn)
+        layout.addLayout(btn_row)
+
+    def _on_key_captured(self, key: str):
+        self._captured_key = key
+        self.hint_label.setText(f"已捕获: {key.upper()}  —  点击「保存」生效")
+        self.save_btn.setEnabled(True)
+
+    def _save(self):
+        if not self._captured_key:
+            return
+        if _register_hotkey(self._captured_key):
+            global _config, _current_hotkey
+            _config["hotkey"] = self._captured_key
+            _save_config(_config)
+            _current_hotkey = self._captured_key
+            self.hotkey_changed.emit(self._captured_key)
+            self.capture_widget.setText(f"当前: {self._captured_key.upper()}  —  点击后按下新快捷键")
+            self.hint_label.setText("已保存 ✓")
+            self.save_btn.setEnabled(False)
+            self._captured_key = None
+        else:
+            QMessageBox.warning(self, "注册失败", f"无法注册热键: {self._captured_key}，请尝试其他按键")
+
+
 # ════════════════ 主窗口 ════════════════
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("泛天贸易中心 - 数据上传")
         self.setMinimumSize(900, 600)
-        self.setAcceptDrops(True)
 
         # 泛天贸易中心配色 — 与网站保持一致
         self.setStyleSheet("""
@@ -130,9 +335,20 @@ class MainWindow(QMainWindow):
             QCheckBox::indicator { width: 16px; height: 16px; }
         """)
 
-        central = QWidget(objectName="central")
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("""
+            QTabWidget::pane { border: none; background: #faf7f0; }
+            QTabBar::tab { background: #f5f0e5; color: #8a8070; padding: 8px 24px;
+                border: none; border-bottom: 2px solid transparent; font-size: 13px; }
+            QTabBar::tab:selected { background: #faf7f0; color: #c9a94e;
+                border-bottom: 2px solid #c9a94e; font-weight: bold; }
+            QTabBar::tab:hover { color: #2d2318; }
+        """)
+        self.setCentralWidget(self.tabs)
+
+        # ── Tab 0: 数据上传 ──
+        upload_tab = QWidget(objectName="central")
+        layout = QVBoxLayout(upload_tab)
         layout.setSpacing(10)
         layout.setContentsMargins(15, 10, 15, 10)
 
@@ -154,7 +370,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(gold_line)
 
         # 提示文字
-        self.title_label = QLabel("拖入截图或 Ctrl+V 粘贴  |  F3 一键截图识别")
+        hotkey_display = _current_hotkey.upper()
+        self.title_label = QLabel(f"按 {hotkey_display} 截图识别  |  全屏截取自动 OCR")
         self.title_label.setObjectName("title")
         layout.addWidget(self.title_label)
 
@@ -171,7 +388,8 @@ class MainWindow(QMainWindow):
         self.drop_zone = QFrame(objectName="dropZone")
         drop_layout = QVBoxLayout(self.drop_zone)
         drop_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label = QLabel("拖入截图\n或 Ctrl+V 粘贴")
+        hotkey_display = _current_hotkey.upper()
+        self.preview_label = QLabel(f"按 {hotkey_display} 截图\n自动 OCR 识别")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setStyleSheet("color: #8a8070; font-size: 14px;")
         drop_layout.addWidget(self.preview_label)
@@ -192,7 +410,7 @@ class MainWindow(QMainWindow):
 
         # 表格
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["商品名", "库存等级", "SCU", "单价", "最大库存"])
+        self.table.setHorizontalHeaderLabels(["商品名", "库存等级", "当前库存", "单价", "最大库存"])
         # 货箱规格暂时禁用
         # self.table = QTableWidget(0, 6)
         # self.table.setHorizontalHeaderLabels(["商品名", "库存等级", "SCU", "单价", "最大库存", "货箱规格"])
@@ -204,9 +422,6 @@ class MainWindow(QMainWindow):
 
         # 操作按钮
         btn_row = QHBoxLayout()
-        self.select_file_btn = QPushButton("选择文件")
-        self.select_file_btn.clicked.connect(self.select_file)
-        btn_row.addWidget(self.select_file_btn)
         btn_row.addStretch()
         self.submit_btn = QPushButton("提交到泛天")
         self.submit_btn.setObjectName("submitBtn")
@@ -218,13 +433,21 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right_panel)
         splitter.setSizes([380, 500])
 
+        # ── Tab 1: 偏好设置 ──
+        self.settings_tab = SettingsTab()
+        self.settings_tab.hotkey_changed.connect(self._on_hotkey_changed)
+
+        # Add tabs
+        self.tabs.addTab(upload_tab, "数据上传")
+        self.tabs.addTab(self.settings_tab, "偏好设置")
+
         # 状态栏
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("就绪")
+        self.status.showMessage(f"就绪  |  按 {_current_hotkey.upper()} 截图")
 
-        # 窗口显示后注册全局热键（需要有效的窗口句柄）
-        QTimer.singleShot(200, self._register_hotkey)
+        # 窗口显示后启动热键轮询
+        QTimer.singleShot(200, self._start_hotkey_timer)
 
         # 预加载 OCR 模型（后台线程，GUI 无感）
         threading.Thread(target=_preload_ocr, daemon=True).start()
@@ -233,35 +456,13 @@ class MainWindow(QMainWindow):
         self.current_image = None
         self.current_result = None
 
-    # ── 拖拽 & 粘贴 ────────────────────────
+    # ── 偏好设置回调 ────────────────────────
 
-    def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event: QDropEvent):
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if os.path.isfile(path):
-                self.process_file(path)
-            return
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_V and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            clipboard = QApplication.clipboard()
-            mime = clipboard.mimeData()
-            if mime.hasImage():
-                img = mime.imageData()
-                if img:
-                    tmp = os.path.join(os.environ["TEMP"], f"sc_paste_{int(time.time())}.png")
-                    img.save(tmp, "PNG")
-                    self.process_file(tmp)
-
-    def select_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择截图", "",
-            "Images (*.png *.jpg *.jpeg *.bmp);;All (*.*)")
-        if path:
-            self.process_file(path)
+    def _on_hotkey_changed(self, new_key: str):
+        hd = new_key.upper()
+        self.title_label.setText(f"按 {hd} 截图识别  |  全屏截取自动 OCR")
+        self.preview_label.setText(f"按 {hd} 截图\n自动 OCR 识别")
+        self.status.showMessage(f"热键已更新: {hd}  |  截图识别")
 
     # ── OCR 处理 ──────────────────────────
 
@@ -304,7 +505,7 @@ class MainWindow(QMainWindow):
 
         # 填表
         self.table.setRowCount(len(items))
-        INVENTORY_LEVELS = ["库存已满", "库存已空", "高", "中", "低", "非常低", "无货", ""]
+        INVENTORY_LEVELS = ["库存已满", "库存已空", "库存将满", "库存充足", "库存中等", "库存偏少", "库存极低", ""]
         for i, item in enumerate(items):
             # 商品名
             name_edit = QLineEdit(item.get("commodityName", ""))
@@ -316,9 +517,9 @@ class MainWindow(QMainWindow):
             inv_combo.setCurrentText(item.get("inventoryLevel") or "")
             self.table.setCellWidget(i, 1, inv_combo)
 
-            # SCU
+            # SCU / 当前库存
             scu_val = item.get("scu")
-            self.table.setItem(i, 2, QTableWidgetItem(str(scu_val) if scu_val else ""))
+            self.table.setItem(i, 2, QTableWidgetItem(str(scu_val) if scu_val is not None else ""))
 
             # 价格
             price_val = item.get("price")
@@ -419,36 +620,26 @@ class MainWindow(QMainWindow):
         except ValueError:
             return None
 
-    # ── 文件夹监控 ────────────────────────
-    def _register_hotkey(self):
-        """Register global hotkey via Windows API. Try F3 first, fallback F4."""
-        self._hotkey_id = 1
-        hwnd = int(self.winId())
-        for vk, label in [(0x72, "F3"), (0x73, "F4")]:
-            ok = ctypes.windll.user32.RegisterHotKey(hwnd, self._hotkey_id, 0, vk)
-            if ok:
-                self.status.showMessage(f"热键 {label} 已就绪")
-                return
-        self.status.showMessage("热键注册失败，请用拖拽或 Ctrl+V")
+    # ── 全局热键 ──────────────────────────
+    def _start_hotkey_timer(self):
+        """Qt timer polls _trigger_event (set by keyboard hotkey thread)."""
+        self._hotkey_timer = QTimer()
+        self._hotkey_timer.timeout.connect(self._check_hotkey)
+        self._hotkey_timer.start(50)
 
-    def nativeEvent(self, eventType, message):
-        """Catch WM_HOTKEY (0x0312) from Windows."""
-        # message is a ctypes pointer to MSG struct
-        try:
-            ptr = int(message)
-            if ptr:
-                msg = ctypes.cast(ptr, ctypes.POINTER(wintypes.MSG)).contents
-                if msg.message == 0x0312:  # WM_HOTKEY
-                    self._on_f3()
-                    return True, 0
-        except:
-            pass
-        return False, 0
+    def _check_hotkey(self):
+        if _trigger_event.is_set():
+            _trigger_event.clear()
+            self._do_screenshot()
 
-    def _on_f3(self):
-        """F3: capture screen and OCR."""
-        tmp = os.path.join(tempfile.gettempdir(), f"sc_f3_{int(time.time())}.png")
-        ImageGrab.grab().save(tmp, "PNG")
+    def _do_screenshot(self):
+        """Capture screen via mss (works with DirectX games) and OCR."""
+        # Camera shutter sound: two-tone click
+        winsound.Beep(1200, 40)
+        winsound.Beep(600, 60)
+        tmp = os.path.join(tempfile.gettempdir(), f"sc_shot_{int(time.time())}.png")
+        with mss.mss() as sct:
+            sct.shot(output=tmp)
         self.process_file(tmp)
 
     def closeEvent(self, event):
@@ -463,10 +654,6 @@ def main():
 
     window = MainWindow()
     window.show()
-
-    # 支持命令行传图
-    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-        window.process_file(sys.argv[1])
 
     sys.exit(app.exec())
 

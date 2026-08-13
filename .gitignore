@@ -1,0 +1,6 @@
+__pycache__/
+build/
+dist/
+screenshots/
+ft_upload_history.json
+*.lnk

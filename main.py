@@ -3,24 +3,23 @@
 参考 sc-trade-companion / SC-Datarunner-UEX
 用法: python main.py
 
-快捷键: F3 = 截图并识别
+快捷键: F3 = 截图 → OCR → 校验 → 自动提交 → 日志记录
 """
 import os
 import sys
 import time
 import threading
-import tempfile
 import winsound
 
 import requests
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
-    QSplitter, QStatusBar, QMessageBox, QComboBox,
-    QCheckBox, QLineEdit, QFrame, QProgressBar, QTabWidget
+    QSplitter, QStatusBar, QMessageBox, QLineEdit, QTabWidget,
+    QListWidget, QListWidgetItem, QListView, QComboBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QPixmap, QFont
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt6.QtGui import QPixmap, QFont, QPainter, QColor, QPen, QIcon
 
 # ════════════════ F3 Hotkey ════════════════
 # Anti-cheat safe (EAC/BattlEye compatible):
@@ -46,17 +45,35 @@ if not ctypes.windll.shell32.IsUserAnAdmin():
 import keyboard
 import json as _json
 
+import history
+
 # ════════════════ Config ════════════════
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ft_upload_config.json")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CONFIG_PATH = os.path.join(_BASE_DIR, "ft_upload_config.json")
+SCREENSHOT_DIR = os.path.join(_BASE_DIR, "screenshots")
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+_API_DEFAULTS = {
+    "hotkey": "f3",
+    "api_base": "http://localhost:4000",
+}
+
+# 服务器选项（设置页下拉框）
+# 生产服备案待审期间冻结，只提供本地开发 + 测试服
+API_SERVERS = [
+    ("本地开发", "http://localhost:4000"),
+    ("测试服", "http://114.55.238.180:3000"),
+]
 
 def _load_config():
+    cfg = dict(_API_DEFAULTS)
     if os.path.exists(_CONFIG_PATH):
         try:
             with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-                return _json.load(f)
+                cfg.update(_json.load(f))
         except:
             pass
-    return {"hotkey": "f3"}
+    return cfg
 
 def _save_config(cfg: dict):
     with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -87,7 +104,8 @@ def _register_hotkey(key: str):
 _register_hotkey(_current_hotkey)
 
 # ════════════════ 配置 ════════════════
-API_BASE = os.environ.get("FT_API", "http://localhost:4000")
+# 提权（UAC）后环境变量丢失，API 地址必须走配置文件
+API_BASE = os.environ.get("FT_API", _config.get("api_base", "http://localhost:4000"))
 
 # ════════════════ 内嵌 OCR（直接引用 ocr-service 模块） ════════════════
 # PyInstaller bundles ocr-service as data; sys._MEIPASS is the temp extract dir
@@ -98,7 +116,7 @@ else:
                                      "sc-trading-hub", "ocr-service")
 if _ocr_service_dir not in sys.path:
     sys.path.insert(0, _ocr_service_dir)
-from server import run_ocr, parse_kiosk, get_ocr  # CnOCR, lazy-load on first call
+from server import run_ocr, parse_kiosk, get_ocr, validate_result  # CnOCR, lazy-load on first call
 
 def _preload_ocr():
     """Preload OCR model in background thread so first F3 is fast."""
@@ -142,6 +160,179 @@ class SubmitWorker(QThread):
             self.finished.emit(resp.json())
         except Exception as e:
             self.error.emit(str(e))
+
+
+# ════════════════ Toast 通知气泡 ════════════════
+
+class Toast(QWidget):
+    """Frameless bottom-right notification bubble, gold theme, auto-dismiss."""
+    _active = []
+
+    def __init__(self, title: str, text: str, ok: bool = True):
+        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self._accent = "#c9a94e" if ok else "#d9534f"
+        self.setStyleSheet(f"""
+            QLabel#t {{ color: {self._accent}; font-weight: bold; font-size: 13px;
+                background: transparent; }}
+            QLabel#b {{ color: #2d2318; font-size: 12px; background: transparent; }}
+        """)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 10, 14, 10)
+        outer.setSpacing(4)
+        t = QLabel(title)
+        t.setObjectName("t")
+        b = QLabel(text)
+        b.setObjectName("b")
+        outer.addWidget(t)
+        outer.addWidget(b)
+        # 成功 3s，失败 5s 自动消失
+        QTimer.singleShot(3000 if ok else 5000, self.close)
+
+    def paintEvent(self, event):
+        """Draw gold-bordered rounded box (QSS background unreliable on bare QWidget)."""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor("#faf7f0"))
+        p.setPen(QPen(QColor(self._accent), 2))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 6, 6)
+
+    def show_at_corner(self):
+        """Show at screen bottom-right, stacking above any active toasts."""
+        self.adjustSize()
+        screen = QApplication.primaryScreen().availableGeometry()
+        x = screen.right() - self.width() - 20
+        y = screen.bottom() - self.height() - 20
+        for w in Toast._active:
+            y -= w.height() + 8
+        self.move(x, y)
+        Toast._active.append(self)
+        self.show()
+
+    def closeEvent(self, event):
+        if self in Toast._active:
+            Toast._active.remove(self)
+        super().closeEvent(event)
+
+
+# ════════════════ 日志页 ════════════════
+
+class LogTab(QWidget):
+    """Left: screenshot thumbnail list. Right: submission detail."""
+
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter)
+
+        # 左侧 — 缩略图日志列表
+        self.list_widget = QListWidget()
+        self.list_widget.setViewMode(QListView.ViewMode.IconMode)
+        self.list_widget.setIconSize(QSize(170, 96))
+        self.list_widget.setResizeMode(QListView.ResizeMode.Adjust)
+        self.list_widget.setSpacing(10)
+        self.list_widget.setWordWrap(True)
+        self.list_widget.itemClicked.connect(self._on_clicked)
+        splitter.addWidget(self.list_widget)
+
+        # 右侧 — 详情
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setSpacing(8)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("font-weight: bold; color: #c9a94e;")
+        rl.addWidget(self.status_label)
+
+        self.info_label = QLabel("点击左侧日志查看详情")
+        self.info_label.setStyleSheet("color: #8a8070;")
+        rl.addWidget(self.info_label)
+
+        self.detail_table = QTableWidget(0, 5)
+        self.detail_table.setHorizontalHeaderLabels(["商品名", "库存等级", "当前库存", "单价", "最大库存"])
+        self.detail_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        header = self.detail_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for i in range(1, 5):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        rl.addWidget(self.detail_table, 1)
+
+        self.img_label = QLabel()
+        self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_label.setMinimumHeight(160)
+        self.img_label.setStyleSheet(
+            "color: #8a8070; background: #ffffff; border: 1px solid #e4dcc8; border-radius: 4px;")
+        rl.addWidget(self.img_label, 1)
+
+        splitter.addWidget(right)
+        splitter.setSizes([430, 620])
+
+        self._entries = history.load_entries()
+        for e in self._entries:
+            self.list_widget.addItem(self._make_item(e))
+        if self._entries:
+            self.list_widget.setCurrentRow(0)
+            self._show_entry(0)
+
+    def _make_item(self, e: dict) -> QListWidgetItem:
+        shot = e.get("screenshot", "")
+        full = os.path.join(_BASE_DIR, shot) if not os.path.isabs(shot) else shot
+        icon = QIcon(full) if os.path.exists(full) else QIcon()
+        label = f"{e.get('time','')}\n{e.get('terminal','')}"
+        item = QListWidgetItem(icon, label)
+        item.setToolTip(e.get("detail", ""))
+        return item
+
+    def add_entry(self, entry: dict):
+        """Persist new entry and insert at top of list."""
+        self._entries = history.append_entry(entry)
+        self.list_widget.insertItem(0, self._make_item(entry))
+        self.list_widget.setCurrentRow(0)
+        self._show_entry(0)
+
+    def _on_clicked(self, item):
+        self._show_entry(self.list_widget.row(item))
+
+    def _show_entry(self, idx: int):
+        if idx < 0 or idx >= len(self._entries):
+            return
+        e = self._entries[idx]
+        status_map = {"success": ("提交成功", "#c9a94e"),
+                      "submit_failed": ("提交失败", "#d9534f"),
+                      "check_failed": ("检查未通过", "#d9534f")}
+        name, color = status_map.get(e.get("status", ""), (e.get("status", "未知"), "#8a8070"))
+        self.status_label.setStyleSheet(f"font-weight: bold; color: {color};")
+        self.status_label.setText(f"{name}  |  {e.get('detail','')}")
+
+        tx = e.get("transactionType", "")
+        tx_cn = "买入" if tx == "buy" else ("卖出" if tx == "sell" else tx)
+        self.info_label.setText(f"{e.get('time','')}  |  终端: {e.get('terminal','')}  |  {tx_cn}")
+
+        items = e.get("items", [])
+        self.detail_table.setRowCount(len(items))
+        for i, it in enumerate(items):
+            self.detail_table.setItem(i, 0, QTableWidgetItem(it.get("commodityName", "")))
+            self.detail_table.setItem(i, 1, QTableWidgetItem(it.get("inventoryLevel") or ""))
+            scu = it.get("scu")
+            self.detail_table.setItem(i, 2, QTableWidgetItem(str(scu) if scu is not None else ""))
+            price = it.get("price")
+            self.detail_table.setItem(i, 3, QTableWidgetItem(str(price) if price is not None else ""))
+            self.detail_table.setItem(i, 4, QTableWidgetItem("✓" if it.get("isMaxStock") else ""))
+
+        shot = e.get("screenshot", "")
+        full = os.path.join(_BASE_DIR, shot) if not os.path.isabs(shot) else shot
+        if full and os.path.exists(full):
+            pm = QPixmap(full)
+            if not pm.isNull():
+                self.img_label.setPixmap(pm.scaledToWidth(560, Qt.TransformationMode.SmoothTransformation))
+                return
+        self.img_label.setPixmap(QPixmap())
+        self.img_label.setText("无截图")
 
 
 # ════════════════ 设置窗口 ════════════════
@@ -248,6 +439,19 @@ class SettingsTab(QWidget):
         self.hint_label.setStyleSheet("color: #8a8070; font-size: 11px;")
         layout.addWidget(self.hint_label)
 
+        layout.addSpacing(12)
+        layout.addWidget(QLabel("数据提交服务器"))
+
+        self.server_combo = QComboBox()
+        current_api = _config.get("api_base", _API_DEFAULTS["api_base"])
+        for label, url in API_SERVERS:
+            self.server_combo.addItem(f"{label}（{url}）", url)
+        for i in range(self.server_combo.count()):
+            if self.server_combo.itemData(i) == current_api:
+                self.server_combo.setCurrentIndex(i)
+                break
+        layout.addWidget(self.server_combo)
+
         layout.addStretch()
 
         btn_row = QHBoxLayout()
@@ -268,20 +472,34 @@ class SettingsTab(QWidget):
         self.save_btn.setEnabled(True)
 
     def _save(self):
-        if not self._captured_key:
-            return
-        if _register_hotkey(self._captured_key):
-            global _config, _current_hotkey
-            _config["hotkey"] = self._captured_key
-            _save_config(_config)
-            _current_hotkey = self._captured_key
-            self.hotkey_changed.emit(self._captured_key)
-            self.capture_widget.setText(f"当前: {self._captured_key.upper()}  —  点击后按下新快捷键")
-            self.hint_label.setText("已保存 ✓")
-            self.save_btn.setEnabled(False)
-            self._captured_key = None
-        else:
-            QMessageBox.warning(self, "注册失败", f"无法注册热键: {self._captured_key}，请尝试其他按键")
+        global _config, _current_hotkey, API_BASE
+        saved = []
+
+        # 服务器选择
+        api_base = self.server_combo.currentData()
+        if api_base and api_base != _config.get("api_base"):
+            _config["api_base"] = api_base
+            API_BASE = api_base
+            saved.append("服务器已切换")
+        elif api_base == _config.get("api_base"):
+            saved.append("服务器未变")
+
+        # 快捷键（仅捕获了新键时）
+        if self._captured_key:
+            if _register_hotkey(self._captured_key):
+                _config["hotkey"] = self._captured_key
+                _current_hotkey = self._captured_key
+                self.hotkey_changed.emit(self._captured_key)
+                self.capture_widget.setText(f"当前: {self._captured_key.upper()}  —  点击后按下新快捷键")
+                saved.append("热键已更新")
+                self._captured_key = None
+            else:
+                QMessageBox.warning(self, "注册失败", f"无法注册热键: {self._captured_key}，请尝试其他按键")
+                return
+
+        _save_config(_config)
+        self.hint_label.setText("  ".join(saved) + " ✓")
+        self.save_btn.setEnabled(False)
 
 
 # ════════════════ 主窗口 ════════════════
@@ -295,12 +513,11 @@ class MainWindow(QMainWindow):
         self.setStyleSheet("""
             QMainWindow, QWidget#central { background: #faf7f0; }
             QLabel { color: #2d2318; font-size: 13px; }
-            QLabel#title { color: #2d2318; font-size: 13px; }
-            QLineEdit, QComboBox {
+            QLineEdit {
                 background: #ffffff; color: #2d2318; border: 1px solid #e4dcc8;
                 padding: 4px 6px; border-radius: 4px; font-size: 12px;
             }
-            QLineEdit:focus, QComboBox:focus { border-color: #c9a94e; }
+            QLineEdit:focus { border-color: #c9a94e; }
             QTableWidget {
                 background: #ffffff; color: #2d2318; gridline-color: #f0ebe0;
                 border: 1px solid #e4dcc8; font-size: 12px;
@@ -317,22 +534,14 @@ class MainWindow(QMainWindow):
             }
             QPushButton:hover { background: #f5f0e5; border-color: #c9a94e; }
             QPushButton:disabled { background: #f0ebe0; color: #8a8070; border-color: #e4dcc8; }
-            QPushButton#submitBtn { background: #c9a94e; color: #ffffff; border: none; font-size: 14px; padding: 7px 28px; font-weight: bold; }
-            QPushButton#submitBtn:hover { background: #b8983d; }
             QStatusBar { background: #faf7f0; color: #8a8070; border-top: 1px solid #e4dcc8; }
-            QProgressBar {
-                border: none; background: #f0ebe0; height: 3px;
-                text-align: center; color: transparent; border-radius: 1px;
-            }
-            QProgressBar::chunk { background: #c9a94e; border-radius: 1px; }
             QSplitter::handle { background: #e4dcc8; width: 1px; }
-            QFrame#dropZone {
-                border: 2px dashed #e4dcc8; border-radius: 8px;
-                background: #ffffff; min-height: 200px;
+            QListWidget {
+                background: #faf7f0; color: #2d2318; border: none;
+                font-size: 11px;
             }
-            QFrame#dropZone:hover { border-color: #c9a94e; background: #faf7f0; }
-            QCheckBox { color: #2d2318; }
-            QCheckBox::indicator { width: 16px; height: 16px; }
+            QListWidget::item { border: 1px solid transparent; border-radius: 4px; padding: 2px; }
+            QListWidget::item:selected { background: #f5f0e5; border: 1px solid #c9a94e; color: #2d2318; }
         """)
 
         self.tabs = QTabWidget()
@@ -346,99 +555,14 @@ class MainWindow(QMainWindow):
         """)
         self.setCentralWidget(self.tabs)
 
-        # ── Tab 0: 数据上传 ──
-        upload_tab = QWidget(objectName="central")
-        layout = QVBoxLayout(upload_tab)
-        layout.setSpacing(10)
-        layout.setContentsMargins(15, 10, 15, 10)
-
-        # 标题
-        title_row = QHBoxLayout()
-        self.logo_label = QLabel("泛天")
-        self.logo_label.setStyleSheet("font-size: 22px; font-weight: bold; color: #c9a94e; font-family: serif;")
-        title_row.addWidget(self.logo_label)
-        self.subtitle_label = QLabel("数据上传工具")
-        self.subtitle_label.setStyleSheet("font-size: 11px; color: #8a8070; padding-top: 8px;")
-        title_row.addWidget(self.subtitle_label)
-        title_row.addStretch()
-        layout.addLayout(title_row)
-
-        # Gold shimmer line
-        gold_line = QFrame()
-        gold_line.setFixedHeight(2)
-        gold_line.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #c9a94e, stop:0.3 #d4b85e, stop:0.5 #c9a94e, stop:0.7 #d4b85e, stop:1 #c9a94e); border: none;")
-        layout.addWidget(gold_line)
-
-        # 提示文字
-        hotkey_display = _current_hotkey.upper()
-        self.title_label = QLabel(f"按 {hotkey_display} 截图识别  |  全屏截取自动 OCR")
-        self.title_label.setObjectName("title")
-        layout.addWidget(self.title_label)
-
-        # 进度条
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        layout.addWidget(self.progress)
-
-        # 主区域：左侧截图预览 + 右侧结果表格
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        layout.addWidget(splitter, 1)
-
-        # 左侧 — 截图预览
-        self.drop_zone = QFrame(objectName="dropZone")
-        drop_layout = QVBoxLayout(self.drop_zone)
-        drop_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        hotkey_display = _current_hotkey.upper()
-        self.preview_label = QLabel(f"按 {hotkey_display} 截图\n自动 OCR 识别")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setStyleSheet("color: #8a8070; font-size: 14px;")
-        drop_layout.addWidget(self.preview_label)
-        splitter.addWidget(self.drop_zone)
-
-        # 右侧 — 结果 + 操作
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setSpacing(8)
-
-        # 终端信息
-        self.terminal_label = QLabel("")
-        self.terminal_label.setStyleSheet("font-weight: bold; color: #4a90d9;")
-        right_layout.addWidget(self.terminal_label)
-
-        self.tx_label = QLabel("")
-        right_layout.addWidget(self.tx_label)
-
-        # 表格
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["商品名", "库存等级", "当前库存", "单价", "最大库存"])
-        # 货箱规格暂时禁用
-        # self.table = QTableWidget(0, 6)
-        # self.table.setHorizontalHeaderLabels(["商品名", "库存等级", "SCU", "单价", "最大库存", "货箱规格"])
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for i in range(1, 5):
-            header.setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
-        right_layout.addWidget(self.table, 1)
-
-        # 操作按钮
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        self.submit_btn = QPushButton("提交到泛天")
-        self.submit_btn.setObjectName("submitBtn")
-        self.submit_btn.setEnabled(False)
-        self.submit_btn.clicked.connect(self.do_submit)
-        btn_row.addWidget(self.submit_btn)
-        right_layout.addLayout(btn_row)
-
-        splitter.addWidget(right_panel)
-        splitter.setSizes([380, 500])
+        # ── Tab 0: 日志（首页） ──
+        self.log_tab = LogTab()
 
         # ── Tab 1: 偏好设置 ──
         self.settings_tab = SettingsTab()
         self.settings_tab.hotkey_changed.connect(self._on_hotkey_changed)
 
-        # Add tabs
-        self.tabs.addTab(upload_tab, "数据上传")
+        self.tabs.addTab(self.log_tab, "日志")
         self.tabs.addTab(self.settings_tab, "偏好设置")
 
         # 状态栏
@@ -453,34 +577,19 @@ class MainWindow(QMainWindow):
         threading.Thread(target=_preload_ocr, daemon=True).start()
 
         # 当前数据
-        self.current_image = None
         self.current_result = None
+        self._current_shot = None
 
     # ── 偏好设置回调 ────────────────────────
 
     def _on_hotkey_changed(self, new_key: str):
-        hd = new_key.upper()
-        self.title_label.setText(f"按 {hd} 截图识别  |  全屏截取自动 OCR")
-        self.preview_label.setText(f"按 {hd} 截图\n自动 OCR 识别")
-        self.status.showMessage(f"热键已更新: {hd}  |  截图识别")
+        self.status.showMessage(f"热键已更新: {new_key.upper()}  |  截图识别")
 
     # ── OCR 处理 ──────────────────────────
 
-    def process_file(self, file_path: str):
-        # 预览
-        pixmap = QPixmap(file_path)
-        if pixmap.isNull():
-            self.status.showMessage(f"无法加载: {file_path}")
-            return
-        scaled = pixmap.scaledToWidth(360, Qt.TransformationMode.SmoothTransformation)
-        self.preview_label.setPixmap(scaled)
-        self.current_image = file_path
-
-        # OCR
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 0)
+    def _process_shot(self, file_path: str):
+        self._current_shot = file_path
         self.status.showMessage("OCR 识别中...")
-        self.submit_btn.setEnabled(False)
 
         self.worker = OcrWorker(file_path)
         self.worker.finished.connect(self.on_ocr_done)
@@ -488,101 +597,52 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
     def on_ocr_done(self, result: dict):
-        self.progress.setVisible(False)
         if not result.get("ok"):
             self.status.showMessage(f"OCR 失败: {result.get('error', 'unknown')}")
+            Toast("提交失败", f"OCR 失败: {result.get('error', 'unknown')}", ok=False).show_at_corner()
+            self._log_outcome("check_failed", f"OCR 失败: {result.get('error', 'unknown')}")
             return
 
         self.current_result = result
         items = result.get("items", [])
         terminal = result.get("terminal", "未知")
         tx = result.get("transactionType", "未知")
-        tx_cn = "买入" if tx == "buy" else "卖出"
-
-        self.terminal_label.setText(f"终端: {terminal}")
-        self.tx_label.setText(f"类型: {tx_cn}  |  {len(items)} 条商品")
+        tx_cn = "买入" if tx == "buy" else ("卖出" if tx == "sell" else "未知")
         self.status.showMessage(f"识别完成: {terminal} {tx_cn} {len(items)}条")
 
-        # 填表
-        self.table.setRowCount(len(items))
-        INVENTORY_LEVELS = ["库存已满", "库存已空", "库存将满", "库存充足", "库存中等", "库存偏少", "库存极低", ""]
-        for i, item in enumerate(items):
-            # 商品名
-            name_edit = QLineEdit(item.get("commodityName", ""))
-            self.table.setCellWidget(i, 0, name_edit)
-
-            # 库存等级
-            inv_combo = QComboBox()
-            inv_combo.addItems(INVENTORY_LEVELS)
-            inv_combo.setCurrentText(item.get("inventoryLevel") or "")
-            self.table.setCellWidget(i, 1, inv_combo)
-
-            # SCU / 当前库存
-            scu_val = item.get("scu")
-            self.table.setItem(i, 2, QTableWidgetItem(str(scu_val) if scu_val is not None else ""))
-
-            # 价格
-            price_val = item.get("price")
-            self.table.setItem(i, 3, QTableWidgetItem(str(price_val) if price_val else ""))
-
-            # 最大库存
-            chk = QCheckBox()
-            chk.setChecked(item.get("isMaxStock", False))
-            chk_widget = QWidget()
-            chk_layout = QHBoxLayout(chk_widget)
-            chk_layout.addWidget(chk)
-            chk_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            chk_layout.setContentsMargins(0, 0, 0, 0)
-            self.table.setCellWidget(i, 4, chk_widget)
-
-            # 货箱规格 — 暂时禁用，精度不够
-            # box = item.get("boxSizes")
-            # if isinstance(box, list) and box:
-            #     box_text = " / ".join(str(b) for b in box)
-            # elif box:
-            #     box_text = str(box)
-            # else:
-            #     box_text = ""
-            # self.table.setItem(i, 5, QTableWidgetItem(box_text))
-
-        self.submit_btn.setEnabled(True)
+        # 校验 → 自动提交
+        ok, reasons = validate_result(result)
+        if ok:
+            self.status.showMessage("检查通过，自动提交中...")
+            self.do_submit()
+        else:
+            self.status.showMessage("检查未通过，未提交")
+            shown = reasons[:3]
+            extra = f"（共{len(reasons)}个问题）" if len(reasons) > 3 else ""
+            Toast("提交失败", "\n".join(shown) + extra, ok=False).show_at_corner()
+            self._log_outcome("check_failed", "; ".join(reasons))
 
     def on_ocr_error(self, err_msg: str):
-        self.progress.setVisible(False)
         self.status.showMessage(f"OCR 服务不可用: {err_msg}")
+        Toast("提交失败", f"OCR 服务不可用: {err_msg}", ok=False).show_at_corner()
+        self._log_outcome("check_failed", f"OCR 服务不可用: {err_msg}")
 
     # ── 提交 ─────────────────────────────
 
     def do_submit(self):
+        """Auto-submit current OCR result. Called after validate_result passes."""
         if not self.current_result:
             return
+        tx = self.current_result.get("transactionType", "buy")
+        items = [{
+            "commodityName": it.get("commodityName", ""),
+            "transactionType": tx,
+            "inventoryLevel": it.get("inventoryLevel") or None,
+            "scu": it.get("scu"),
+            "price": it.get("price"),
+            "isMaxStock": it.get("isMaxStock", False),
+        } for it in self.current_result.get("items", [])]
 
-        # 从表格读最新数据
-        items = []
-        ocr_items = self.current_result.get("items", [])
-        for i in range(self.table.rowCount()):
-            name_widget = self.table.cellWidget(i, 0)
-            inv_widget = self.table.cellWidget(i, 1)
-            chk_widget = self.table.cellWidget(i, 4)
-            name = name_widget.text() if isinstance(name_widget, QLineEdit) else ""
-            inv = inv_widget.currentText() if isinstance(inv_widget, QComboBox) else ""
-            is_max = False
-            if chk_widget:
-                chk = chk_widget.findChild(QCheckBox)
-                if chk:
-                    is_max = chk.isChecked()
-
-            items.append({
-                "commodityName": name,
-                "transactionType": self.current_result.get("transactionType", "buy"),
-                "inventoryLevel": inv or None,
-                "scu": self._parse_int(self.table.item(i, 2)),
-                "price": self._parse_float(self.table.item(i, 3)),
-                "isMaxStock": is_max,
-                # "boxSizes": ocr_items[i].get("boxSizes") if i < len(ocr_items) else None,  # 暂时禁用
-            })
-
-        self.submit_btn.setEnabled(False)
         self.status.showMessage("提交中...")
         self.worker2 = SubmitWorker({
             "terminal": self.current_result.get("terminal", ""),
@@ -593,32 +653,46 @@ class MainWindow(QMainWindow):
         self.worker2.start()
 
     def on_submit_done(self, resp: dict):
-        self.submit_btn.setEnabled(True)
         if resp.get("ok"):
-            QMessageBox.information(self, "成功", f"已提交 {resp.get('upserted', 0)} 条数据")
-            self.status.showMessage(f"提交成功: {resp.get('upserted', 0)} 条")
+            n = resp.get("upserted", 0)
+            self.status.showMessage(f"提交成功: {n} 条")
+            Toast("提交成功", f"已提交 {n} 条数据").show_at_corner()
+            self._log_outcome("success", f"已提交 {n} 条")
         else:
-            QMessageBox.warning(self, "失败", resp.get("error", "未知错误"))
+            self.status.showMessage("提交失败")
+            Toast("提交失败", resp.get("error", "未知错误"), ok=False).show_at_corner()
+            self._log_outcome("submit_failed", resp.get("error", "未知错误"))
 
     def on_submit_error(self, err_msg: str):
-        self.submit_btn.setEnabled(True)
-        QMessageBox.critical(self, "网络错误", err_msg)
+        self.status.showMessage("提交失败（网络错误）")
+        Toast("提交失败", f"网络错误: {err_msg}", ok=False).show_at_corner()
+        self._log_outcome("submit_failed", f"网络错误: {err_msg}")
 
-    def _parse_int(self, item):
-        if not item or not item.text():
-            return None
-        try:
-            return int(item.text().replace(",", ""))
-        except ValueError:
-            return None
+    # ── 日志记录 ──────────────────────────
 
-    def _parse_float(self, item):
-        if not item or not item.text():
-            return None
-        try:
-            return float(item.text().replace(",", ""))
-        except ValueError:
-            return None
+    def _log_outcome(self, status: str, detail: str):
+        items = []
+        if self.current_result:
+            tx = self.current_result.get("transactionType", "buy")
+            items = [{
+                "commodityName": it.get("commodityName", ""),
+                "transactionType": tx,
+                "inventoryLevel": it.get("inventoryLevel") or None,
+                "scu": it.get("scu"),
+                "price": it.get("price"),
+                "isMaxStock": it.get("isMaxStock", False),
+            } for it in self.current_result.get("items", [])]
+        shot = os.path.relpath(self._current_shot, _BASE_DIR) if self._current_shot else ""
+        entry = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": status,
+            "terminal": (self.current_result or {}).get("terminal", ""),
+            "transactionType": (self.current_result or {}).get("transactionType", ""),
+            "detail": detail,
+            "items": items,
+            "screenshot": shot.replace("\\", "/"),
+        }
+        self.log_tab.add_entry(entry)
 
     # ── 全局热键 ──────────────────────────
     def _start_hotkey_timer(self):
@@ -633,14 +707,14 @@ class MainWindow(QMainWindow):
             self._do_screenshot()
 
     def _do_screenshot(self):
-        """Capture screen via mss (works with DirectX games) and OCR."""
+        """Capture screen via mss (works with DirectX games), save to screenshots/."""
         # Camera shutter sound: two-tone click
         winsound.Beep(1200, 40)
         winsound.Beep(600, 60)
-        tmp = os.path.join(tempfile.gettempdir(), f"sc_shot_{int(time.time())}.png")
+        path = os.path.join(SCREENSHOT_DIR, time.strftime("sc_shot_%Y%m%d_%H%M%S.png"))
         with mss.mss() as sct:
-            sct.shot(output=tmp)
-        self.process_file(tmp)
+            sct.shot(output=path)
+        self._process_shot(path)
 
     def closeEvent(self, event):
         event.accept()

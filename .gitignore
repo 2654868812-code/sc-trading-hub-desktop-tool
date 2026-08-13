@@ -4,3 +4,4 @@ dist/
 screenshots/
 ft_upload_history.json
 *.lnk
+ft_mem.log

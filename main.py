@@ -32,7 +32,6 @@ from PyQt6.QtGui import QPixmap, QFont, QPainter, QColor, QPen, QIcon
 # and has been verified working with EAC.
 
 import ctypes
-import mss
 
 # Auto-elevate: if not admin, relaunch as admin
 if not ctypes.windll.shell32.IsUserAnAdmin():
@@ -44,18 +43,24 @@ if not ctypes.windll.shell32.IsUserAnAdmin():
 
 import keyboard
 import json as _json
+import subprocess
 
 import history
 
 # ════════════════ Config ════════════════
-_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# onefile 打包后 __file__ 指向临时解压目录，配置/截图必须放 exe 旁边
+if getattr(sys, 'frozen', False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _CONFIG_PATH = os.path.join(_BASE_DIR, "ft_upload_config.json")
 SCREENSHOT_DIR = os.path.join(_BASE_DIR, "screenshots")
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 _API_DEFAULTS = {
     "hotkey": "f3",
-    "api_base": "http://localhost:4000",
+    # 默认测试服（发给测试人员的包开箱即用；本地开发可在设置里切）
+    "api_base": "http://114.55.238.180:3000",
 }
 
 # 服务器选项（设置页下拉框）
@@ -107,6 +112,65 @@ _register_hotkey(_current_hotkey)
 # 提权（UAC）后环境变量丢失，API 地址必须走配置文件
 API_BASE = os.environ.get("FT_API", _config.get("api_base", "http://localhost:4000"))
 
+# ── 快门音 ──
+# 内存同步播放（SND_MEMORY|SND_SYNC）：异步/文件播放多次后静音的坑全避开。
+# 游戏占音频设备导致失败时兜底 MessageBeep(-1) 系统蜂鸣。
+_SHUTTER_WAV = None
+
+def _load_shutter_bytes():
+    global _SHUTTER_WAV
+    if _SHUTTER_WAV is None:
+        if getattr(sys, 'frozen', False):
+            fp = os.path.join(sys._MEIPASS, "shutter.wav")
+        else:
+            fp = os.path.join(_BASE_DIR, "shutter.wav")
+        try:
+            with open(fp, "rb") as f:
+                _SHUTTER_WAV = f.read()
+        except Exception:
+            _SHUTTER_WAV = b""
+    return _SHUTTER_WAV
+
+def _thumb_path(shot_path: str) -> str:
+    base, ext = os.path.splitext(shot_path)
+    return base + "_thumb.png"
+
+def _make_thumbnail(shot_path: str):
+    """Generate small thumbnail next to screenshot — log list icons load
+    this instead of the full image (11MB decode per entry otherwise)."""
+    try:
+        pm = QPixmap(shot_path)
+        if pm.isNull():
+            return
+        pm.scaledToWidth(320, Qt.TransformationMode.SmoothTransformation).save(_thumb_path(shot_path))
+    except Exception:
+        pass
+
+def _trim_working_set():
+    """Trim working set — return idle pages to OS after each cycle."""
+    try:
+        ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1, -1)
+    except Exception:
+        pass
+
+def _play_shutter():
+    """Play shutter sound in a daemon thread — sync playback must never
+    block the GUI thread (game holding the audio device would freeze it)."""
+    def _play():
+        wav = _load_shutter_bytes()
+        if wav:
+            try:
+                # 不传 SND_ASYNC 即同步播放；SND_SYNC 常量 3.14 才有，3.12 会 AttributeError
+                winsound.PlaySound(wav, winsound.SND_MEMORY)
+                return
+            except Exception:
+                pass
+        try:
+            winsound.MessageBeep(-1)
+        except Exception:
+            pass
+    threading.Thread(target=_play, daemon=True).start()
+
 # ════════════════ 内嵌 OCR（直接引用 ocr-service 模块） ════════════════
 # PyInstaller bundles ocr-service as data; sys._MEIPASS is the temp extract dir
 if getattr(sys, 'frozen', False):
@@ -141,6 +205,10 @@ class OcrWorker(QThread):
                 img_bytes = f.read()
             lines, img_h = run_ocr(img_bytes)
             result = parse_kiosk(lines, img_h)
+            # 释放推理期间的大块内存（截图缓冲/中间数组）
+            import gc
+            del img_bytes, lines
+            gc.collect()
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
@@ -282,16 +350,21 @@ class LogTab(QWidget):
     def _make_item(self, e: dict) -> QListWidgetItem:
         shot = e.get("screenshot", "")
         full = os.path.join(_BASE_DIR, shot) if not os.path.isabs(shot) else shot
-        icon = QIcon(full) if os.path.exists(full) else QIcon()
+        # 优先用缩略图（小文件，省解码内存）；没有则回退原图
+        thumb = _thumb_path(full)
+        icon_src = thumb if os.path.exists(thumb) else full
+        icon = QIcon(icon_src) if os.path.exists(icon_src) else QIcon()
         label = f"{e.get('time','')}\n{e.get('terminal','')}"
         item = QListWidgetItem(icon, label)
         item.setToolTip(e.get("detail", ""))
         return item
 
     def add_entry(self, entry: dict):
-        """Persist new entry and insert at top of list."""
+        """Persist new entry and insert at top of list (capped)."""
         self._entries = history.append_entry(entry)
         self.list_widget.insertItem(0, self._make_item(entry))
+        while self.list_widget.count() > history.MAX_ENTRIES:
+            self.list_widget.takeItem(self.list_widget.count() - 1)
         self.list_widget.setCurrentRow(0)
         self._show_entry(0)
 
@@ -671,6 +744,8 @@ class MainWindow(QMainWindow):
     # ── 日志记录 ──────────────────────────
 
     def _log_outcome(self, status: str, detail: str):
+        # 每轮结束 2 秒后修剪工作集（把推理峰值内存还给 OS，学 Mem Reduct）
+        QTimer.singleShot(2000, _trim_working_set)
         items = []
         if self.current_result:
             tx = self.current_result.get("transactionType", "buy")
@@ -704,16 +779,30 @@ class MainWindow(QMainWindow):
     def _check_hotkey(self):
         if _trigger_event.is_set():
             _trigger_event.clear()
+            # OCR/提交进行中忽略连按（否则截到动画帧，解析必失败）
+            if hasattr(self, "worker") and self.worker.isRunning():
+                return
+            if hasattr(self, "worker2") and self.worker2.isRunning():
+                return
             self._do_screenshot()
 
     def _do_screenshot(self):
-        """Capture screen via mss (works with DirectX games), save to screenshots/."""
-        # Camera shutter sound: two-tone click
-        winsound.Beep(1200, 40)
-        winsound.Beep(600, 60)
+        """Capture screen via child process (GDI capture leaks ~20MB heap per
+        shot in-process; a short-lived child returns it all to the OS)."""
+        _play_shutter()
         path = os.path.join(SCREENSHOT_DIR, time.strftime("sc_shot_%Y%m%d_%H%M%S.png"))
-        with mss.mss() as sct:
-            sct.shot(output=path)
+        if getattr(sys, 'frozen', False):
+            cap_cmd = [os.path.join(os.path.dirname(sys.executable), "FT-Capture.exe"), path]
+        else:
+            cap_cmd = [sys.executable, os.path.join(_BASE_DIR, "capture_main.py"), path]
+        try:
+            subprocess.run(cap_cmd, timeout=10)
+        except Exception:
+            pass
+        if not os.path.exists(path):
+            self.status.showMessage("截图失败")
+            return
+        _make_thumbnail(path)
         self._process_shot(path)
 
     def closeEvent(self, event):

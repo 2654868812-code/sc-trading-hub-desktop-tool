@@ -47,6 +47,19 @@ def test_corrupted_file_returns_empty():
     os.remove(p)
 
 
+def test_append_caps_entries():
+    p = _tmp_path()
+    if os.path.exists(p):
+        os.remove(p)
+    for i in range(60):
+        history.append_entry({"time": str(i), "status": "success"}, p)
+    entries = history.load_entries(p)
+    assert len(entries) == history.MAX_ENTRIES
+    assert entries[0]["time"] == "59"   # 最新在前
+    assert entries[-1]["time"] == str(60 - history.MAX_ENTRIES)
+    os.remove(p)
+
+
 if __name__ == "__main__":
     import traceback
     failed = 0

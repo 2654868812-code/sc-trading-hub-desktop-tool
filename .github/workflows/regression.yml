@@ -1,0 +1,48 @@
+name: Desktop Regression
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-regression-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: Python regression
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Test history persistence
+        run: python test_history.py
+
+      - name: Test upload contract
+        run: python test_upload_contract.py
+
+      - name: Compile core Python files
+        run: >-
+          python -m py_compile
+          main.py
+          upload_contract.py
+          history.py
+          capture_main.py

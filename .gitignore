@@ -5,3 +5,5 @@ screenshots/
 ft_upload_history.json
 *.lnk
 ft_mem.log
+ft_upload_config.json
+HANDOFF-CODEX.md

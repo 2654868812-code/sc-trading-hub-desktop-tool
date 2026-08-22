@@ -19,6 +19,8 @@ a = Analysis(
         (os.path.join(_ocr_dir, 'server.py'), 'ocr-service'),
         # 快门音
         (os.path.join(_spec_dir, 'shutter.wav'), '.'),
+        # Logo（关于页 + 窗口图标）
+        (os.path.join(_spec_dir, 'assets', 'logo.png'), 'assets'),
         # Commodity/location lookup tables for spellcheck
         (os.path.join(_ocr_dir, '..', 'src', 'lib', 'commodity-zh.ts'), 'ocr-service'),
         (os.path.join(_ocr_dir, '..', 'src', 'lib', 'location-zh.ts'), 'ocr-service'),
@@ -60,6 +62,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='FT-DataUpload',
+    icon=os.path.join(_spec_dir, 'assets', 'logo.ico'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -107,6 +110,7 @@ exe_capture = EXE(
     [],
     exclude_binaries=True,
     name='FT-Capture',
+    icon=os.path.join(_spec_dir, 'assets', 'logo.ico'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

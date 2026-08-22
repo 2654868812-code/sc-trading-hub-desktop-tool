@@ -1,6 +1,7 @@
 """Regression tests for release archive metadata generation."""
 
 import json
+import os
 import sys
 import tempfile
 import traceback
@@ -15,23 +16,24 @@ def test_release_archive_emits_importable_metadata_and_checksum():
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         source = root / "FT-DataUpload"
-        (source / "runtime").mkdir(parents=True)
+        (source / "_internal" / "runtime").mkdir(parents=True)
         (source / "FT-DataUpload.exe").write_bytes(b"desktop executable")
-        (source / "runtime" / "model.bin").write_bytes(b"ocr model")
+        (source / "FT-Capture.exe").write_bytes(b"capture executable")
+        (source / "_internal" / "runtime" / "model.bin").write_bytes(b"ocr model")
 
         archive, metadata_file, checksum_file, metadata = create_release_archive(
             source,
             root / "release",
-            version="1.4.0",
+            version="1.5.0",
             generated_at="2026-08-22T12:00:00Z",
         )
 
-        assert archive.name == "FT-DataUpload-v1.4.0.zip"
+        assert archive.name == "FT-DataUpload-v1.5.0.zip"
         assert metadata_file.name == "release-info.json"
-        assert checksum_file.name == "FT-DataUpload-v1.4.0.sha256.txt"
+        assert checksum_file.name == "FT-DataUpload-v1.5.0.sha256.txt"
         assert metadata == json.loads(metadata_file.read_text(encoding="utf-8"))
         assert metadata["schemaVersion"] == 1
-        assert metadata["version"] == "1.4.0"
+        assert metadata["version"] == "1.5.0"
         assert metadata["sizeBytes"] == archive.stat().st_size
         assert metadata["sha256"] == sha256_file(archive)
         assert checksum_file.read_text(encoding="utf-8") == (
@@ -39,14 +41,15 @@ def test_release_archive_emits_importable_metadata_and_checksum():
         )
 
         with ZipFile(archive) as package:
-            assert package.namelist() == [
+            assert set(package.namelist()) == {
+                "FT-DataUpload/FT-Capture.exe",
                 "FT-DataUpload/FT-DataUpload.exe",
-                "FT-DataUpload/runtime/model.bin",
-            ]
+                "FT-DataUpload/_internal/runtime/model.bin",
+            }
 
 
 def test_release_builder_uses_the_application_contract_version():
-    assert APP_VERSION == "1.4.0"
+    assert APP_VERSION == "1.5.0"
 
 
 def test_release_builder_rejects_invalid_version_and_empty_distribution():
@@ -57,6 +60,58 @@ def test_release_builder_rejects_invalid_version_and_empty_distribution():
         try:
             create_release_archive(empty, root / "release", version="not-a-version")
             raise AssertionError("invalid version should fail")
+        except ValueError:
+            pass
+
+
+def _valid_distribution(root: Path) -> Path:
+    source = root / "FT-DataUpload"
+    (source / "_internal").mkdir(parents=True)
+    (source / "FT-DataUpload.exe").write_bytes(b"app")
+    (source / "FT-Capture.exe").write_bytes(b"capture")
+    (source / "_internal" / "runtime.dll").write_bytes(b"runtime")
+    return source
+
+
+def test_release_builder_rejects_missing_helper_and_sensitive_runtime_data():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        source = _valid_distribution(root)
+        (source / "FT-Capture.exe").unlink()
+        try:
+            create_release_archive(source, root / "release")
+            raise AssertionError("missing capture helper should fail")
+        except FileNotFoundError:
+            pass
+
+    for relative in ("ft_ocr.log", "ft_upload_config.json", "screenshots/shot.png", "unknown.txt"):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = _valid_distribution(root)
+            extra = source / relative
+            extra.parent.mkdir(parents=True, exist_ok=True)
+            extra.write_bytes(b"private")
+            try:
+                create_release_archive(source, root / "release")
+                raise AssertionError(f"sensitive/unknown path should fail: {relative}")
+            except ValueError:
+                pass
+
+
+def test_release_builder_rejects_symlinks_when_supported():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        source = _valid_distribution(root)
+        target = root / "outside.dll"
+        target.write_bytes(b"outside")
+        link = source / "_internal" / "linked.dll"
+        try:
+            os.symlink(target, link)
+        except (OSError, NotImplementedError):
+            return
+        try:
+            create_release_archive(source, root / "release")
+            raise AssertionError("release must reject symlinks")
         except ValueError:
             pass
 

@@ -9,6 +9,7 @@ from upload_contract import (
     build_snapshot_payload,
     is_valid_device_id,
     is_upload_ready,
+    normalize_scm_id,
 )
 
 
@@ -16,15 +17,16 @@ DEVICE_ID = "123e4567-e89b-42d3-a456-426614174000"
 
 
 def test_release_version_matches_backend_gate():
-    assert APP_VERSION == "1.4.0"
+    assert APP_VERSION == "1.5.0"
 
 
-def test_upload_gate_requires_explicit_consent_but_scm_id_is_optional():
+def test_upload_gate_requires_scm_id_and_explicit_consent():
     assert is_upload_ready("player-123", True) is True
-    assert is_upload_ready("  ", True) is True
-    assert is_upload_ready("", True) is True
+    assert is_upload_ready("  ", True) is False
+    assert is_upload_ready("", True) is False
     assert is_upload_ready("player-123", False) is False
     assert is_upload_ready("player-123", 1) is False
+    assert is_upload_ready("x" * 101, True) is False
 
 
 def test_snapshot_items_use_page_transaction_and_preserve_reliable_max_signal():
@@ -61,7 +63,7 @@ def test_snapshot_items_use_page_transaction_and_preserve_reliable_max_signal():
     ]
 
 
-def test_payload_contains_identity_version_terminal_and_does_not_mutate_ocr_result():
+def test_payload_contains_optional_scm_points_metadata_without_mutating_result():
     result = {
         "terminal": "列夫斯基",
         "transactionType": "buy",
@@ -75,6 +77,20 @@ def test_payload_contains_identity_version_terminal_and_does_not_mutate_ocr_resu
     assert payload["deviceId"] == DEVICE_ID
     assert payload["items"][0]["transactionType"] == "buy"
     assert result == original
+
+    anonymous_payload = build_snapshot_payload(result, "  ", DEVICE_ID)
+    assert "scmId" not in anonymous_payload
+
+
+def test_scm_id_is_optional_bounded_points_metadata():
+    assert normalize_scm_id("  player-123  ") == "player-123"
+    assert normalize_scm_id("") == ""
+    for invalid in ("x" * 101, "player\n123", "player\x7f123"):
+        try:
+            normalize_scm_id(invalid)
+            raise AssertionError("invalid SCM ID should fail")
+        except ValueError:
+            pass
 
 
 def test_device_id_is_required_and_must_be_a_random_uuid4_shape():

@@ -11,123 +11,154 @@ import time
 import threading
 import winsound
 import uuid
+import re
+from pathlib import Path
 
-import requests
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
     QSplitter, QStatusBar, QMessageBox, QLineEdit, QTabWidget,
     QListWidget, QListWidgetItem, QListView, QComboBox, QCheckBox,
-    QTextBrowser, QDialog
+    QTextBrowser, QDialog, QFrame
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl
-from PyQt6.QtGui import QPixmap, QFont, QPainter, QColor, QPen, QIcon, QDesktopServices
+from PyQt6.QtGui import (
+    QPixmap, QFont, QFontDatabase, QPainter, QColor, QPen, QIcon, QDesktopServices
+)
 
 # ════════════════ F3 Hotkey ════════════════
 # Anti-cheat safe (EAC/BattlEye compatible):
 # - keyboard: WH_KEYBOARD_LL hook (OS-level, same as Discord/OBS hotkeys)
 # - mss: desktop screenshot via BitBlt/DXGI (standard Windows API)
 # - NO DLL injection, NO memory reading, NO overlay, NO game process interaction
-# Admin elevation only needed for UIPI bypass when game runs elevated.
+# The assistant intentionally stays at standard-user integrity. If a game is
+# elevated and Windows blocks the hook, the user can choose another hotkey.
 #
 # sc-trade-companion uses same architecture (JNativeHook + Robot screenshot)
 # and has been verified working with EAC.
 
 import ctypes
 
-# Auto-elevate: if not admin, relaunch as admin
-if not ctypes.windll.shell32.IsUserAnAdmin():
-    ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable,
-        " ".join(f'"{a}"' if ' ' in a else a for a in sys.argv),
-        os.path.dirname(os.path.abspath(__file__)), 1)
-    sys.exit(0)
-
 import keyboard
-import json as _json
 import subprocess
 
+from app_storage import (
+    CONFIG_PATH,
+    SCREENSHOT_DIR as USER_SCREENSHOT_DIR,
+    atomic_write_json,
+    ensure_storage,
+    load_json_object,
+    migrate_legacy_storage,
+)
 import history
 from upload_contract import (
     APP_VERSION,
     build_snapshot_items,
     build_snapshot_payload,
+    is_valid_device_id,
     is_upload_ready,
+    normalize_scm_id,
 )
 from update_checker import DATA_COLLECTION_URL, check_for_update
+from transport_security import normalize_api_base, secure_post_json
 
 # ════════════════ Config ════════════════
-# onefile 打包后 __file__ 指向临时解压目录，配置/截图必须放 exe 旁边
+# Immutable assets/helpers live with the installation; mutable state does not.
 if getattr(sys, 'frozen', False):
     _BASE_DIR = os.path.dirname(sys.executable)
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_CONFIG_PATH = os.path.join(_BASE_DIR, "ft_upload_config.json")
-SCREENSHOT_DIR = os.path.join(_BASE_DIR, "screenshots")
-os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+ensure_storage()
+migrate_legacy_storage(Path(_BASE_DIR))
+_CONFIG_PATH = str(CONFIG_PATH)
+SCREENSHOT_DIR = str(USER_SCREENSHOT_DIR)
 
 _API_DEFAULTS = {
     "hotkey": "f3",
-    # 默认测试服（发给测试人员的包开箱即用；本地开发可在设置里切）
-    "api_base": "http://114.55.238.180:3000",
-    # SCM 账号 ID（积分统计用，非登录凭证）+ 隐私政策同意状态
-    "scm_id": "",
+    "api_base": "https://fantiantradinghub.xyz",
     "privacy_agreed": False,
+    "scm_id": "",
 }
 
 # 服务器选项（设置页下拉框）
-# 生产服备案待审期间冻结，只提供本地开发 + 测试服
 API_SERVERS = [
+    ("正式服务（HTTPS）", "https://fantiantradinghub.xyz"),
     ("本地开发", "http://localhost:4000"),
-    ("测试服", "http://114.55.238.180:3000"),
 ]
+
+_HOTKEY_RE = re.compile(r"^(?:(?:ctrl|shift|alt)\+){0,3}(?:f(?:[1-9]|1[0-2])|[a-z0-9]|space)$")
 
 def _load_config():
     cfg = dict(_API_DEFAULTS)
-    if os.path.exists(_CONFIG_PATH):
+    loaded = load_json_object(CONFIG_PATH)
+    if loaded:
+        hotkey = str(loaded.get("hotkey", "")).lower().strip()
+        if _HOTKEY_RE.fullmatch(hotkey):
+            cfg["hotkey"] = hotkey
         try:
-            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg.update(_json.load(f))
-        except:
+            cfg["api_base"] = normalize_api_base(loaded.get("api_base"))
+        except Exception:
             pass
+        cfg["privacy_agreed"] = loaded.get("privacy_agreed") is True
+        try:
+            cfg["scm_id"] = normalize_scm_id(loaded.get("scm_id"))
+        except ValueError:
+            cfg["scm_id"] = ""
+        if isinstance(loaded.get("device_id"), str):
+            cfg["device_id"] = loaded["device_id"]
     return cfg
 
 def _save_config(cfg: dict):
-    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-        _json.dump(cfg, f, indent=2, ensure_ascii=False)
+    safe = {
+        "hotkey": cfg.get("hotkey", "f3"),
+        "api_base": normalize_api_base(cfg.get("api_base", _API_DEFAULTS["api_base"])),
+        "privacy_agreed": cfg.get("privacy_agreed") is True,
+        "scm_id": normalize_scm_id(cfg.get("scm_id")),
+        "device_id": cfg.get("device_id", ""),
+    }
+    atomic_write_json(CONFIG_PATH, safe)
 
 _config = _load_config()
-_config.setdefault("scm_id", "")
 _config.setdefault("privacy_agreed", False)
-if not _config.get("device_id"):
+if not is_valid_device_id(_config.get("device_id")):
     _config["device_id"] = str(uuid.uuid4())
-    _save_config(_config)
+# Rewrite only the validated configuration subset on startup.
+_save_config(_config)
 _current_hotkey = _config.get("hotkey", "f3")
 
 _trigger_event = threading.Event()
+_hotkey_handle = None
 
 def _on_hotkey():
     _trigger_event.set()
 
 def _register_hotkey(key: str):
-    """Register global hotkey via keyboard library. Returns True on success."""
-    global _current_hotkey
+    """Register first, then release the old handle so failure is non-destructive."""
+    global _current_hotkey, _hotkey_handle
+    if not _HOTKEY_RE.fullmatch(str(key).lower().strip()):
+        return False
     try:
-        keyboard.remove_all_hotkeys()
-    except:
-        pass
-    try:
-        keyboard.add_hotkey(key, _on_hotkey)
+        new_handle = keyboard.add_hotkey(key, _on_hotkey)
+        old_handle = _hotkey_handle
+        _hotkey_handle = new_handle
         _current_hotkey = key
+        if old_handle is not None:
+            try:
+                keyboard.remove_hotkey(old_handle)
+            except Exception:
+                pass
         return True
     except Exception:
         return False
 
-_register_hotkey(_current_hotkey)
+_PREVIEW_MODE = os.environ.get("FT_DESKTOP_UI_PREVIEW") == "1"
+_hotkey_registered = False if _PREVIEW_MODE else _register_hotkey(_current_hotkey)
 
 # ════════════════ 配置 ════════════════
-# 提权（UAC）后环境变量丢失，API 地址必须走配置文件
-API_BASE = os.environ.get("FT_API", _config.get("api_base", "http://localhost:4000"))
+try:
+    API_BASE = normalize_api_base(os.environ.get("FT_API", _config["api_base"]))
+except Exception:
+    API_BASE = _API_DEFAULTS["api_base"]
 
 # ── 资源路径 ──
 def _asset_path(name: str) -> str:
@@ -200,8 +231,11 @@ def _play_shutter():
 if getattr(sys, 'frozen', False):
     _ocr_service_dir = os.path.join(sys._MEIPASS, "ocr-service")
 else:
-    _ocr_service_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                     "sc-trading-hub", "ocr-service")
+    _ocr_service_dir = os.environ.get("FT_OCR_SERVICE_DIR") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "sc-trading-hub",
+        "ocr-service",
+    )
 if _ocr_service_dir not in sys.path:
     sys.path.insert(0, _ocr_service_dir)
 from server import run_ocr, parse_kiosk, get_ocr, validate_result  # CnOCR, lazy-load on first call
@@ -248,8 +282,12 @@ class SubmitWorker(QThread):
 
     def run(self):
         try:
-            resp = requests.post(f"{API_BASE}/api/upload/snapshot", json=self.data, timeout=10)
-            self.finished.emit(resp.json())
+            self.finished.emit(secure_post_json(
+                API_BASE,
+                "/api/upload/snapshot",
+                self.data,
+                timeout=10,
+            ))
         except Exception as e:
             self.error.emit(str(e))
 
@@ -273,11 +311,11 @@ class Toast(QWidget):
                          | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self._accent = "#c9a94e" if ok else "#d9534f"
+        self._accent = "#167C78" if ok else "#B64D4F"
         self.setStyleSheet(f"""
             QLabel#t {{ color: {self._accent}; font-weight: bold; font-size: 13px;
                 background: transparent; }}
-            QLabel#b {{ color: #2d2318; font-size: 12px; background: transparent; }}
+            QLabel#b {{ color: #14292F; font-size: 12px; background: transparent; }}
         """)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 10, 14, 10)
@@ -295,7 +333,7 @@ class Toast(QWidget):
         """Draw gold-bordered rounded box (QSS background unreliable on bare QWidget)."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QColor("#faf7f0"))
+        p.setBrush(QColor("#FBFDFC"))
         p.setPen(QPen(QColor(self._accent), 2))
         p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 6, 6)
 
@@ -327,6 +365,17 @@ class LogTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
 
+        heading_row = QHBoxLayout()
+        heading = QLabel("本地上传记录")
+        heading.setObjectName("sectionTitle")
+        heading_row.addWidget(heading)
+        heading_row.addStretch()
+        clear_button = QPushButton("清除历史与截图")
+        clear_button.setObjectName("dangerButton")
+        clear_button.clicked.connect(self._clear_history)
+        heading_row.addWidget(clear_button)
+        layout.addLayout(heading_row)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         layout.addWidget(splitter)
 
@@ -346,11 +395,11 @@ class LogTab(QWidget):
         rl.setSpacing(8)
 
         self.status_label = QLabel("")
-        self.status_label.setStyleSheet("font-weight: bold; color: #c9a94e;")
+        self.status_label.setStyleSheet("font-weight: bold; color: #167C78;")
         rl.addWidget(self.status_label)
 
         self.info_label = QLabel("点击左侧日志查看详情")
-        self.info_label.setStyleSheet("color: #8a8070;")
+        self.info_label.setStyleSheet("color: #6E7F83;")
         rl.addWidget(self.info_label)
 
         self.detail_table = QTableWidget(0, 5)
@@ -366,7 +415,7 @@ class LogTab(QWidget):
         self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.img_label.setMinimumHeight(160)
         self.img_label.setStyleSheet(
-            "color: #8a8070; background: #ffffff; border: 1px solid #e4dcc8; border-radius: 4px;")
+            "color: #6E7F83; background: #FBFDFC; border: 1px solid #CFDAD7; border-radius: 12px;")
         rl.addWidget(self.img_label, 1)
 
         splitter.addWidget(right)
@@ -381,9 +430,10 @@ class LogTab(QWidget):
 
     def _make_item(self, e: dict) -> QListWidgetItem:
         shot = e.get("screenshot", "")
-        full = os.path.join(_BASE_DIR, shot) if not os.path.isabs(shot) else shot
+        resolved = history.resolve_screenshot_path(shot)
+        full = str(resolved) if resolved else ""
         # 优先用缩略图（小文件，省解码内存）；没有则回退原图
-        thumb = _thumb_path(full)
+        thumb = _thumb_path(full) if full else ""
         icon_src = thumb if os.path.exists(thumb) else full
         icon = QIcon(icon_src) if os.path.exists(icon_src) else QIcon()
         label = f"{e.get('time','')}\n{e.get('terminal','')}"
@@ -403,14 +453,33 @@ class LogTab(QWidget):
     def _on_clicked(self, item):
         self._show_entry(self.list_widget.row(item))
 
+    def _clear_history(self):
+        answer = QMessageBox.question(
+            self,
+            "清除本地记录",
+            "将永久删除本机上传历史、截图和缩略图。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        removed = history.clear_entries()
+        self._entries = []
+        self.list_widget.clear()
+        self.detail_table.setRowCount(0)
+        self.status_label.setText("")
+        self.info_label.setText(f"已清除 {removed} 条本地记录")
+        self.img_label.setPixmap(QPixmap())
+        self.img_label.setText("无截图")
+
     def _show_entry(self, idx: int):
         if idx < 0 or idx >= len(self._entries):
             return
         e = self._entries[idx]
-        status_map = {"success": ("提交成功", "#c9a94e"),
-                      "submit_failed": ("提交失败", "#d9534f"),
-                      "check_failed": ("检查未通过", "#d9534f")}
-        name, color = status_map.get(e.get("status", ""), (e.get("status", "未知"), "#8a8070"))
+        status_map = {"success": ("提交成功", "#167C78"),
+                      "submit_failed": ("提交失败", "#B64D4F"),
+                      "check_failed": ("检查未通过", "#B64D4F")}
+        name, color = status_map.get(e.get("status", ""), (e.get("status", "未知"), "#6E7F83"))
         self.status_label.setStyleSheet(f"font-weight: bold; color: {color};")
         self.status_label.setText(f"{name}  |  {e.get('detail','')}")
 
@@ -430,7 +499,8 @@ class LogTab(QWidget):
             self.detail_table.setItem(i, 4, QTableWidgetItem("✓" if it.get("isMaxStock") else ""))
 
         shot = e.get("screenshot", "")
-        full = os.path.join(_BASE_DIR, shot) if not os.path.isabs(shot) else shot
+        resolved = history.resolve_screenshot_path(shot)
+        full = str(resolved) if resolved else ""
         if full and os.path.exists(full):
             pm = QPixmap(full)
             if not pm.isNull():
@@ -452,10 +522,10 @@ class HotkeyCaptureWidget(QLineEdit):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setStyleSheet("""
-            QLineEdit { background: #f5f0e5; border: 2px dashed #e4dcc8;
-                padding: 12px 24px; font-size: 16px; color: #8a8070;
-                border-radius: 4px; min-height: 50px; }
-            QLineEdit:focus { border-color: #c9a94e; background: #fff; color: #2d2318; }
+            QLineEdit { background: #E7EEEC; border: 2px dashed #CFDAD7;
+                padding: 12px 24px; font-size: 16px; color: #6E7F83;
+                border-radius: 12px; min-height: 50px; }
+            QLineEdit:focus { border-color: #167C78; background: #FBFDFC; color: #14292F; }
         """)
         self._capturing = False
 
@@ -463,9 +533,9 @@ class HotkeyCaptureWidget(QLineEdit):
         self._capturing = True
         self.setText("按下快捷键...")
         self.setStyleSheet("""
-            QLineEdit { background: #fff; border: 2px solid #c9a94e;
-                padding: 12px 24px; font-size: 16px; color: #c9a94e;
-                border-radius: 4px; min-height: 50px; }
+            QLineEdit { background: #FBFDFC; border: 2px solid #167C78;
+                padding: 12px 24px; font-size: 16px; color: #167C78;
+                border-radius: 12px; min-height: 50px; }
         """)
         super().mousePressEvent(event)
 
@@ -498,9 +568,9 @@ class HotkeyCaptureWidget(QLineEdit):
             self.setText(f"已捕获: {captured.upper()}")
             self.key_captured.emit(captured)
             self.setStyleSheet("""
-                QLineEdit { background: #f5f0e5; border: 2px dashed #c9a94e;
-                    padding: 12px 24px; font-size: 16px; color: #2d2318;
-                    border-radius: 4px; min-height: 50px; }
+                QLineEdit { background: #E7EEEC; border: 2px dashed #167C78;
+                    padding: 12px 24px; font-size: 16px; color: #14292F;
+                    border-radius: 12px; min-height: 50px; }
             """)
         else:
             self.setText("未识别的按键，请重试")
@@ -509,20 +579,24 @@ class HotkeyCaptureWidget(QLineEdit):
 class SettingsTab(QWidget):
     """Settings tab embedded in main window."""
     hotkey_changed = pyqtSignal(str)
+    server_changed = pyqtSignal(str)
     show_privacy = pyqtSignal()
 
     def __init__(self):
         super().__init__()
         self.setStyleSheet("""
-            QWidget { background: #faf7f0; }
-            QLabel { color: #2d2318; font-size: 13px; }
-            QLabel#title { font-size: 18px; font-weight: bold; color: #c9a94e; font-family: serif; }
-            QPushButton { background: #ffffff; color: #2d2318; border: 1px solid #e4dcc8;
-                padding: 8px 20px; border-radius: 4px; font-size: 14px; }
-            QPushButton:hover { background: #f5f0e5; border-color: #c9a94e; }
-            QPushButton#saveBtn { background: #c9a94e; color: #fff; border: none;
-                font-weight: bold; padding: 8px 28px; }
-            QPushButton#saveBtn:hover { background: #b8983d; }
+            QWidget { background: #F2F5F4; }
+            QLabel { color: #14292F; font-size: 13px; }
+            QLabel#title { font-size: 18px; font-weight: 700; color: #167C78; }
+            QLabel#mutedText { color: #6E7F83; }
+            QPushButton { background: #FBFDFC; color: #14292F; border: 1px solid #CFDAD7;
+                padding: 0 20px; min-height: 36px; border-radius: 12px; font-size: 14px; }
+            QPushButton:hover { background: #E7EEEC; border-color: #167C78; }
+            QPushButton:focus { border: 2px solid #167C78; }
+            QPushButton#saveBtn { background: #167C78; color: #fff; border: none;
+                font-weight: 700; padding: 0 28px; min-height: 38px; }
+            QPushButton#saveBtn:hover { background: #155F5D; }
+            QPushButton#saveBtn:disabled { background: #CFDAD7; color: #6E7F83; }
         """)
         self._captured_key = None
 
@@ -542,7 +616,7 @@ class SettingsTab(QWidget):
         layout.addWidget(self.capture_widget)
 
         self.hint_label = QLabel("")
-        self.hint_label.setStyleSheet("color: #8a8070; font-size: 11px;")
+        self.hint_label.setStyleSheet("color: #6E7F83; font-size: 11px;")
         layout.addWidget(self.hint_label)
 
         layout.addSpacing(12)
@@ -561,8 +635,15 @@ class SettingsTab(QWidget):
         layout.addSpacing(12)
         layout.addWidget(QLabel("积分账号与隐私"))
 
+        anonymous_hint = QLabel(
+            "使用前必须填写 SCM ID，可为自己账户累计积分；SCM ID 可在网页账户窗口中看到。"
+        )
+        anonymous_hint.setObjectName("mutedText")
+        anonymous_hint.setWordWrap(True)
+        layout.addWidget(anonymous_hint)
+
         account_btn_row = QHBoxLayout()
-        account_btn = QPushButton("设置可选 SCM ID / 查看隐私政策")
+        account_btn = QPushButton("设置 SCM ID / 隐私")
         account_btn.clicked.connect(lambda: self.show_privacy.emit())
         account_btn_row.addWidget(account_btn)
         account_btn_row.addStretch()
@@ -573,12 +654,13 @@ class SettingsTab(QWidget):
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         cancel_btn = QPushButton("取消")
-        cancel_btn.clicked.connect(self.close)
+        cancel_btn.clicked.connect(self._reset)
         btn_row.addWidget(cancel_btn)
         self.save_btn = QPushButton("保存")
         self.save_btn.setObjectName("saveBtn")
         self.save_btn.clicked.connect(self._save)
         self.save_btn.setEnabled(False)
+        self.server_combo.currentIndexChanged.connect(lambda _index: self.save_btn.setEnabled(True))
         btn_row.addWidget(self.save_btn)
         layout.addLayout(btn_row)
 
@@ -587,15 +669,30 @@ class SettingsTab(QWidget):
         self.hint_label.setText(f"已捕获: {key.upper()}  —  点击「保存」生效")
         self.save_btn.setEnabled(True)
 
+    def _reset(self):
+        self._captured_key = None
+        self.capture_widget.setText(f"当前: {_current_hotkey.upper()}  —  点击后按下新快捷键")
+        for index in range(self.server_combo.count()):
+            if self.server_combo.itemData(index) == _config.get("api_base"):
+                self.server_combo.setCurrentIndex(index)
+                break
+        self.hint_label.setText("未保存的更改已撤销")
+        self.save_btn.setEnabled(False)
+
     def _save(self):
         global _config, _current_hotkey, API_BASE
         saved = []
 
         # 服务器选择
-        api_base = self.server_combo.currentData()
+        try:
+            api_base = normalize_api_base(self.server_combo.currentData())
+        except Exception as exc:
+            QMessageBox.warning(self, "服务器地址不安全", str(exc))
+            return
         if api_base and api_base != _config.get("api_base"):
             _config["api_base"] = api_base
             API_BASE = api_base
+            self.server_changed.emit(api_base)
             saved.append("服务器已切换")
         elif api_base == _config.get("api_base"):
             saved.append("服务器未变")
@@ -620,40 +717,38 @@ class SettingsTab(QWidget):
 
 # ════════════════ 关于 ════════════════
 _PRIVACY_HTML = """
-<h3 style="color:#c9a94e;">隐私政策</h3>
+<h3 style="color:#167C78;">隐私政策</h3>
 <p><b>一、我们收集哪些信息</b></p>
 <p>1. 从您按 {hotkey} 主动截取的交易终端画面中识别出的结构化数据（终端、商品、买卖类型、价格和库存）；</p>
 <p>2. 桌面助手版本号与本机随机生成的设备标识（仅用于版本兼容、上传限流、重复检测和多来源确认，不用于确认真实身份）；</p>
-<p>3. 您选择填写的 SCM ID（可留空，仅用于把积分关联到已在网站登录过的账号，并非登录凭证，服务器不据此核验身份）；</p>
-<p>4. 请求来源 IP（服务安全与滥用防护）。</p>
-<p><b>截图说明：</b>截图与上传历史保存在本机程序目录，用于识别和本地回看；截图不会随行情数据上传，您可自行删除本地文件。</p>
+<p>3. 请求来源 IP（服务安全与滥用防护），以及您填写的 SCM ID。</p>
+<p><b>截图说明：</b>截图与上传历史保存在当前 Windows 用户的本地应用数据目录，用于识别和本地回看；截图不会随行情数据上传，您可在日志页一键清除。</p>
 <p><b>二、我们如何使用信息</b></p>
-<p>1. 行情数据会经过格式校验、异常筛选和必要的多来源确认；通过规则的数据更新公开行情，待确认或隔离的数据留待系统或管理员复核；</p>
-<p>2. 若填写的 SCM ID 对应已注册账号，符合计分条件的记录每条 +1 分，每账号每日最多 100 分，10 分钟内重复内容不重复计分；</p>
-<p>3. 积分仅作上传激励统计，不构成任何兑换承诺。</p>
+<p>1. 符合多来源一致性规则的行情可自动公开，来源不足或异常的数据等待管理员复核；</p>
+<p>2. 使用桌面助手必须填写 SCM ID 并同意本政策。SCM ID 仅用于匹配已注册账号并记录积分，不影响审核、限流或封禁。该 ID 由您手动填写，不能证明身份，请勿填写他人的 ID。</p>
 <p><b>三、信息存储</b></p>
-<p>结构化行情、审核记录与必要的来源信息存储于中华人民共和国境内的服务器。公开行情不会显示设备标识、来源 IP 或您填写的 SCM ID。请勿填写他人的 SCM ID。</p>
+<p>结构化行情、审核记录与必要的来源信息存储于中华人民共和国境内的服务器。公开行情不会显示设备标识或来源 IP。</p>
 <p><b>四、您的权利</b></p>
-<p>您可以在“偏好设置 → 设置可选 SCM ID / 查看隐私政策”中撤回同意；撤回后工具将停止截图与上传。已提交的行情和审核记录可能在去除账号关联后继续保留。如需查询、更正或删除个人信息，请联系下方渠道。</p>
+<p>您可以在“偏好设置 → 设置 SCM ID / 隐私”中修改 SCM ID 或撤回同意；撤回后工具将停止截图与上传。已提交的行情和审核记录可能继续保留。如需查询、更正或删除个人信息，请联系下方渠道。</p>
 <p>联系方式：QQ 群 1083464126</p>
-<p style="color:#8a8070;font-size:11px;">最后更新：2026 年 8 月 22 日</p>
+<p style="color:#6E7F83;font-size:11px;">最后更新：2026 年 8 月 23 日</p>
 """
 
 _LICENSES_HTML = """
-<h3 style="color:#c9a94e;">开源许可</h3>
+<h3 style="color:#167C78;">开源许可</h3>
 <p>本工具基于以下开源项目构建，特此致谢：</p>
 <table cellpadding="4" cellspacing="0" style="border-collapse:collapse;">
-<tr><td style="border-bottom:1px solid #e4dcc8;">PyQt6</td><td style="border-bottom:1px solid #e4dcc8;">GPL-3.0-only</td><td style="border-bottom:1px solid #e4dcc8;">界面框架</td></tr>
-<tr><td style="border-bottom:1px solid #e4dcc8;">CnOCR</td><td style="border-bottom:1px solid #e4dcc8;">Apache-2.0</td><td style="border-bottom:1px solid #e4dcc8;">文字识别引擎</td></tr>
-<tr><td style="border-bottom:1px solid #e4dcc8;">CnStd</td><td style="border-bottom:1px solid #e4dcc8;">Apache-2.0</td><td style="border-bottom:1px solid #e4dcc8;">文本检测</td></tr>
-<tr><td style="border-bottom:1px solid #e4dcc8;">RapidOCR</td><td style="border-bottom:1px solid #e4dcc8;">Apache-2.0</td><td style="border-bottom:1px solid #e4dcc8;">OCR 模型（PP-OCRv6）</td></tr>
-<tr><td style="border-bottom:1px solid #e4dcc8;">opencv-python</td><td style="border-bottom:1px solid #e4dcc8;">Apache-2.0</td><td style="border-bottom:1px solid #e4dcc8;">图像处理</td></tr>
-<tr><td style="border-bottom:1px solid #e4dcc8;">requests</td><td style="border-bottom:1px solid #e4dcc8;">Apache-2.0</td><td style="border-bottom:1px solid #e4dcc8;">HTTP 客户端</td></tr>
-<tr><td style="border-bottom:1px solid #e4dcc8;">mss</td><td style="border-bottom:1px solid #e4dcc8;">MIT</td><td style="border-bottom:1px solid #e4dcc8;">屏幕截图</td></tr>
-<tr><td style="border-bottom:1px solid #e4dcc8;">keyboard</td><td style="border-bottom:1px solid #e4dcc8;">MIT</td><td style="border-bottom:1px solid #e4dcc8;">全局快捷键</td></tr>
-<tr><td style="border-bottom:1px solid #e4dcc8;">ONNX Runtime</td><td style="border-bottom:1px solid #e4dcc8;">MIT</td><td style="border-bottom:1px solid #e4dcc8;">模型推理</td></tr>
-<tr><td style="border-bottom:1px solid #e4dcc8;">Pillow</td><td style="border-bottom:1px solid #e4dcc8;">MIT-CMU</td><td style="border-bottom:1px solid #e4dcc8;">图像处理</td></tr>
-<tr><td style="border-bottom:1px solid #e4dcc8;">NumPy</td><td style="border-bottom:1px solid #e4dcc8;">BSD-3-Clause</td><td style="border-bottom:1px solid #e4dcc8;">数值计算</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">PyQt6</td><td style="border-bottom:1px solid #CFDAD7;">GPL-3.0-only</td><td style="border-bottom:1px solid #CFDAD7;">界面框架</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">CnOCR</td><td style="border-bottom:1px solid #CFDAD7;">Apache-2.0</td><td style="border-bottom:1px solid #CFDAD7;">文字识别引擎</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">CnStd</td><td style="border-bottom:1px solid #CFDAD7;">Apache-2.0</td><td style="border-bottom:1px solid #CFDAD7;">文本检测</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">RapidOCR</td><td style="border-bottom:1px solid #CFDAD7;">Apache-2.0</td><td style="border-bottom:1px solid #CFDAD7;">OCR 模型（PP-OCRv6）</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">opencv-python</td><td style="border-bottom:1px solid #CFDAD7;">Apache-2.0</td><td style="border-bottom:1px solid #CFDAD7;">图像处理</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">requests</td><td style="border-bottom:1px solid #CFDAD7;">Apache-2.0</td><td style="border-bottom:1px solid #CFDAD7;">HTTP 客户端</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">mss</td><td style="border-bottom:1px solid #CFDAD7;">MIT</td><td style="border-bottom:1px solid #CFDAD7;">屏幕截图</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">keyboard</td><td style="border-bottom:1px solid #CFDAD7;">MIT</td><td style="border-bottom:1px solid #CFDAD7;">全局快捷键</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">ONNX Runtime</td><td style="border-bottom:1px solid #CFDAD7;">MIT</td><td style="border-bottom:1px solid #CFDAD7;">模型推理</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">Pillow</td><td style="border-bottom:1px solid #CFDAD7;">MIT-CMU</td><td style="border-bottom:1px solid #CFDAD7;">图像处理</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">NumPy</td><td style="border-bottom:1px solid #CFDAD7;">BSD-3-Clause</td><td style="border-bottom:1px solid #CFDAD7;">数值计算</td></tr>
 <tr><td>PyInstaller</td><td>GPL（bootloader 例外）</td><td>构建期组件，未随程序分发</td></tr>
 </table>
 <p style="margin-top:10px;"><b>GPL 声明：</b>本工具包含 GPL-3.0 许可的 PyQt6（本工具唯一的 GPL 运行时组件）。
@@ -667,11 +762,11 @@ class AboutTab(QWidget):
     def __init__(self):
         super().__init__()
         self.setStyleSheet("""
-            QWidget { background: #faf7f0; }
-            QLabel { color: #2d2318; }
-            QLabel#title { font-size: 18px; font-weight: bold; color: #c9a94e; font-family: serif; }
-            QTextBrowser { background: #ffffff; color: #2d2318; border: 1px solid #e4dcc8;
-                border-radius: 4px; padding: 8px; font-size: 12px; }
+            QWidget { background: #F2F5F4; }
+            QLabel { color: #14292F; }
+            QLabel#title { font-size: 18px; font-weight: 700; color: #167C78; }
+            QTextBrowser { background: #FBFDFC; color: #14292F; border: 1px solid #CFDAD7;
+                border-radius: 12px; padding: 8px; font-size: 12px; }
         """)
 
         layout = QVBoxLayout(self)
@@ -693,7 +788,7 @@ class AboutTab(QWidget):
         layout.addWidget(title)
 
         version_label = QLabel(f"版本 {APP_VERSION}")
-        version_label.setStyleSheet("color: #8a8070; font-size: 11px;")
+        version_label.setStyleSheet("color: #6E7F83; font-size: 11px;")
         version_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(version_label)
 
@@ -701,13 +796,13 @@ class AboutTab(QWidget):
         self.browser.setOpenExternalLinks(True)
         self.browser.setHtml(
             _PRIVACY_HTML.format(hotkey=_current_hotkey.upper()) +
-            "<hr style='border:none;border-top:1px solid #e4dcc8;margin:12px 0;'>" +
+            "<hr style='border:none;border-top:1px solid #CFDAD7;margin:12px 0;'>" +
             _LICENSES_HTML
         )
         layout.addWidget(self.browser, 1)
 
         contact = QLabel("泛天商会 · QQ 群 1083464126 · fantiantradinghub.xyz")
-        contact.setStyleSheet("color: #8a8070; font-size: 11px;")
+        contact.setStyleSheet("color: #6E7F83; font-size: 11px;")
         contact.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(contact)
 
@@ -715,26 +810,28 @@ class AboutTab(QWidget):
 class FirstRunDialog(QDialog):
     """Configure optional points ID and upload consent."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, require_ready=False):
         super().__init__(parent)
+        self.require_ready = require_ready
         self.setWindowTitle("上传与隐私设置 - 泛天贸易中心")
         self.setModal(True)
         self.setFixedWidth(420)
         self.setStyleSheet("""
-            QDialog { background: #faf7f0; }
-            QLabel { color: #2d2318; font-size: 13px; }
-            QLabel#title { font-size: 16px; font-weight: bold; color: #c9a94e; font-family: serif; }
-            QLabel#hint { color: #8a8070; font-size: 11px; }
-            QLineEdit { background: #ffffff; color: #2d2318; border: 1px solid #e4dcc8;
-                padding: 6px 8px; border-radius: 4px; font-size: 13px; }
-            QLineEdit:focus { border-color: #c9a94e; }
-            QPushButton { background: #ffffff; color: #2d2318; border: 1px solid #e4dcc8;
-                padding: 6px 14px; border-radius: 4px; font-size: 13px; }
-            QPushButton:hover { background: #f5f0e5; border-color: #c9a94e; }
-            QPushButton#confirmBtn { background: #c9a94e; color: #fff; border: none;
-                font-weight: bold; padding: 8px 24px; }
-            QPushButton#confirmBtn:hover { background: #b8983d; }
-            QPushButton#confirmBtn:disabled { background: #d9cfa8; }
+            QDialog { background: #F2F5F4; }
+            QLabel { color: #14292F; font-size: 13px; }
+            QLabel#title { font-size: 16px; font-weight: 700; color: #167C78; }
+            QLabel#hint { color: #6E7F83; font-size: 11px; }
+            QLineEdit { background: #FBFDFC; color: #14292F; border: 1px solid #CFDAD7;
+                padding: 6px 8px; border-radius: 12px; font-size: 13px; }
+            QLineEdit:focus { border: 2px solid #167C78; }
+            QPushButton { background: #FBFDFC; color: #14292F; border: 1px solid #CFDAD7;
+                padding: 0 14px; min-height: 36px; border-radius: 12px; font-size: 13px; }
+            QPushButton:hover { background: #E7EEEC; border-color: #167C78; }
+            QPushButton:focus { border: 2px solid #167C78; }
+            QPushButton#confirmBtn { background: #167C78; color: #fff; border: none;
+                font-weight: 700; padding: 0 24px; min-height: 38px; }
+            QPushButton#confirmBtn:hover { background: #155F5D; }
+            QPushButton#confirmBtn:disabled { background: #CFDAD7; }
         """)
 
         layout = QVBoxLayout(self)
@@ -745,17 +842,17 @@ class FirstRunDialog(QDialog):
         title.setObjectName("title")
         layout.addWidget(title)
 
-        hint = QLabel("上传前请阅读隐私政策并选择是否同意。\n"
-                      "SCM ID 可留空；如需积分，请填写网站头像菜单中显示的 SCM ID。")
+        hint = QLabel("使用前请填写 SCM ID，并阅读和同意隐私政策。")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        layout.addWidget(QLabel("SCM ID（可选，仅用于积分）"))
-        self.scm_id_edit = QLineEdit()
-        self.scm_id_edit.setPlaceholderText("不需要积分可留空")
-        self.scm_id_edit.setText(_config.get("scm_id", ""))
-        layout.addWidget(self.scm_id_edit)
+        layout.addWidget(QLabel("SCM ID（必填）"))
+        self.scm_input = QLineEdit()
+        self.scm_input.setMaxLength(100)
+        self.scm_input.setPlaceholderText("可在网页账户窗口中查看")
+        self.scm_input.setText(_config.get("scm_id", ""))
+        layout.addWidget(self.scm_input)
 
         agree_row = QHBoxLayout()
         self.privacy_check = QCheckBox("我已阅读并同意《隐私政策》")
@@ -780,19 +877,24 @@ class FirstRunDialog(QDialog):
         btn_row.addWidget(self.confirm_btn)
         layout.addLayout(btn_row)
 
-        self.scm_id_edit.textChanged.connect(self._update_confirm)
         self.privacy_check.stateChanged.connect(lambda _s: self._update_confirm())
+        self.scm_input.textChanged.connect(lambda _text: self._update_confirm())
         self._update_confirm()
 
     def _update_confirm(self):
-        # SCM ID is optional, and keeping this enabled lets users withdraw consent.
-        self.confirm_btn.setEnabled(True)
+        if not self.require_ready:
+            # Settings mode still permits withdrawing consent or clearing data.
+            self.confirm_btn.setEnabled(True)
+            return
+        self.confirm_btn.setEnabled(
+            is_upload_ready(self.scm_input.text(), self.privacy_check.isChecked())
+        )
 
     def _show_policy(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("隐私政策")
         dlg.setFixedSize(520, 480)
-        dlg.setStyleSheet("QDialog { background: #faf7f0; } QTextBrowser { background: #ffffff; border: 1px solid #e4dcc8; border-radius: 4px; font-size: 12px; }")
+        dlg.setStyleSheet("QDialog { background: #F2F5F4; } QTextBrowser { background: #FBFDFC; border: 1px solid #CFDAD7; border-radius: 12px; font-size: 12px; }")
         lay = QVBoxLayout(dlg)
         browser = QTextBrowser()
         browser.setOpenExternalLinks(True)
@@ -807,7 +909,17 @@ class FirstRunDialog(QDialog):
         dlg.exec()
 
     def _confirm(self):
-        scm_id = self.scm_id_edit.text().strip()
+        try:
+            scm_id = normalize_scm_id(self.scm_input.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "SCM ID 无效", str(exc))
+            return
+        if self.require_ready and not scm_id:
+            QMessageBox.warning(self, "请填写 SCM ID", "SCM ID 可在网页账户窗口中查看。")
+            return
+        if self.require_ready and not self.privacy_check.isChecked():
+            QMessageBox.warning(self, "请同意隐私政策", "同意隐私政策后才能使用桌面助手。")
+            return
         _config["scm_id"] = scm_id
         _config["privacy_agreed"] = self.privacy_check.isChecked()
         _save_config(_config)
@@ -821,51 +933,131 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("泛天贸易中心 - 数据上传")
         self.setMinimumSize(900, 600)
 
-        # 泛天贸易中心配色 — 与网站保持一致
+        # 泛天贸易中心网站设计语言：深海蓝品牌栏 + 冷灰白工作区。
         self.setStyleSheet("""
-            QMainWindow, QWidget#central { background: #faf7f0; }
-            QLabel { color: #2d2318; font-size: 13px; }
+            QMainWindow, QWidget#central { background: #F2F5F4; }
+            QLabel { color: #14292F; font-size: 13px; }
+            QFrame#brandHeader { background: #14292F; border: none; }
+            QLabel#brandEyebrow { color: #B8892F; font-size: 11px; font-weight: 700; }
+            QLabel#brandTitle { color: #FBFDFC; font-size: 20px; font-weight: 700; }
+            QLabel#brandMeta { color: #AFC0C0; font-size: 11px; }
+            QLabel#secureChip { background: #155F5D; color: #F3FBFA; border: 1px solid #5F9F9C;
+                border-radius: 12px; padding: 4px 10px; font-size: 11px; font-weight: 700; }
+            QFrame#pipelineCard { background: #FBFDFC; border: 1px solid #CFDAD7; border-radius: 12px; }
+            QLabel#pipelineStep { color: #6E7F83; border: 1px solid #CFDAD7;
+                border-radius: 10px; padding: 7px 12px; font-weight: 600; }
+            QLabel#pipelineStep[state="active"] { color: #167C78; background: #DCEBEA; border-color: #167C78; }
+            QLabel#pipelineStep[state="done"] { color: #155F5D; background: #E7EEEC; border-color: #9AB9B6; }
+            QLabel#pipelineStep[state="error"] { color: #B64D4F; background: #FAEAEA; border-color: #B64D4F; }
+            QLabel#pipelineArrow { color: #B8892F; font-size: 16px; }
+            QLabel#pipelineMessage { color: #6E7F83; font-size: 11px; }
+            QLabel#sectionTitle { color: #14292F; font-size: 17px; font-weight: 700; }
             QLineEdit {
-                background: #ffffff; color: #2d2318; border: 1px solid #e4dcc8;
-                padding: 4px 6px; border-radius: 4px; font-size: 12px;
+                background: #FBFDFC; color: #14292F; border: 1px solid #CFDAD7;
+                padding: 5px 8px; border-radius: 12px; font-size: 12px;
             }
-            QLineEdit:focus { border-color: #c9a94e; }
+            QComboBox { background: #FBFDFC; color: #14292F; border: 1px solid #CFDAD7;
+                border-radius: 12px; padding: 0 10px; min-height: 36px; }
+            QComboBox::drop-down { border: none; width: 28px; }
+            QCheckBox { color: #14292F; spacing: 8px; }
+            QLineEdit:focus, QComboBox:focus { border: 2px solid #167C78; }
             QTableWidget {
-                background: #ffffff; color: #2d2318; gridline-color: #f0ebe0;
-                border: 1px solid #e4dcc8; font-size: 12px;
-                border-radius: 4px;
+                background: #FBFDFC; color: #14292F; gridline-color: #E4EAE8;
+                border: 1px solid #CFDAD7; font-size: 12px; border-radius: 12px;
             }
-            QTableWidget::item:selected { background: #c9a94e; color: #fff; }
+            QTableWidget::item:selected { background: #167C78; color: #fff; }
             QHeaderView::section {
-                background: #f5f0e5; color: #2d2318; padding: 5px 4px;
-                border: none; border-bottom: 1px solid #e4dcc8; font-size: 12px; font-weight: bold;
+                background: #E7EEEC; color: #14292F; padding: 7px 5px;
+                border: none; border-bottom: 1px solid #CFDAD7; font-size: 12px; font-weight: 700;
             }
             QPushButton {
-                background: #ffffff; color: #2d2318; border: 1px solid #e4dcc8;
-                padding: 6px 16px; border-radius: 4px; font-size: 13px;
+                background: #FBFDFC; color: #14292F; border: 1px solid #CFDAD7;
+                padding: 0 16px; min-height: 36px; border-radius: 12px; font-size: 13px;
             }
-            QPushButton:hover { background: #f5f0e5; border-color: #c9a94e; }
-            QPushButton:disabled { background: #f0ebe0; color: #8a8070; border-color: #e4dcc8; }
-            QStatusBar { background: #faf7f0; color: #8a8070; border-top: 1px solid #e4dcc8; }
-            QSplitter::handle { background: #e4dcc8; width: 1px; }
+            QPushButton:hover { background: #E7EEEC; border-color: #167C78; }
+            QPushButton:focus { border: 2px solid #167C78; }
+            QPushButton:disabled { background: #E4EAE8; color: #6E7F83; border-color: #CFDAD7; }
+            QPushButton#dangerButton { color: #B64D4F; border-color: #D9A6A7; }
+            QPushButton#dangerButton:hover { background: #FAEAEA; border-color: #B64D4F; }
+            QStatusBar { background: #FBFDFC; color: #6E7F83; border-top: 1px solid #CFDAD7; }
+            QSplitter::handle { background: #CFDAD7; width: 1px; }
             QListWidget {
-                background: #faf7f0; color: #2d2318; border: none;
-                font-size: 11px;
+                background: #F2F5F4; color: #14292F; border: none; font-size: 11px;
             }
-            QListWidget::item { border: 1px solid transparent; border-radius: 4px; padding: 2px; }
-            QListWidget::item:selected { background: #f5f0e5; border: 1px solid #c9a94e; color: #2d2318; }
+            QListWidget::item { border: 1px solid transparent; border-radius: 12px; padding: 3px; }
+            QListWidget::item:selected { background: #DCEBEA; border: 1px solid #167C78; color: #14292F; }
         """)
+
+        central = QWidget()
+        central.setObjectName("central")
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        self.setCentralWidget(central)
+
+        header = QFrame()
+        header.setObjectName("brandHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(20, 13, 20, 13)
+        header_layout.setSpacing(12)
+        logo_path = _asset_path("logo.png")
+        if os.path.exists(logo_path):
+            logo = QLabel()
+            logo_pixmap = QPixmap(logo_path)
+            if not logo_pixmap.isNull():
+                logo.setPixmap(logo_pixmap.scaled(44, 44, Qt.AspectRatioMode.KeepAspectRatio,
+                                                  Qt.TransformationMode.SmoothTransformation))
+                header_layout.addWidget(logo)
+        brand_stack = QVBoxLayout()
+        brand_stack.setSpacing(1)
+        eyebrow = QLabel("FANTIAN TRADING HUB")
+        eyebrow.setObjectName("brandEyebrow")
+        brand_stack.addWidget(eyebrow)
+        brand_title = QLabel("泛天贸易中心桌面助手")
+        brand_title.setObjectName("brandTitle")
+        brand_stack.addWidget(brand_title)
+        brand_meta = QLabel(f"行情采集工作台 · v{APP_VERSION}")
+        brand_meta.setObjectName("brandMeta")
+        brand_stack.addWidget(brand_meta)
+        header_layout.addLayout(brand_stack)
+        header_layout.addStretch()
+        self.secure_chip = QLabel()
+        self.secure_chip.setObjectName("secureChip")
+        header_layout.addWidget(self.secure_chip)
+        central_layout.addWidget(header)
+
+        pipeline = QFrame()
+        pipeline.setObjectName("pipelineCard")
+        pipeline_layout = QHBoxLayout(pipeline)
+        pipeline_layout.setContentsMargins(16, 10, 16, 10)
+        pipeline_layout.setSpacing(9)
+        self.pipeline_steps = []
+        for index, text in enumerate(("本机截图", "本地识别", "安全上传")):
+            step = QLabel(f"0{index + 1}  {text}")
+            step.setObjectName("pipelineStep")
+            step.setProperty("state", "idle")
+            self.pipeline_steps.append(step)
+            pipeline_layout.addWidget(step)
+            if index < 2:
+                arrow = QLabel("→")
+                arrow.setObjectName("pipelineArrow")
+                pipeline_layout.addWidget(arrow)
+        self.pipeline_message = QLabel("数据只在识别完成并通过校验后上传")
+        self.pipeline_message.setObjectName("pipelineMessage")
+        pipeline_layout.addWidget(self.pipeline_message, 1)
+        central_layout.addWidget(pipeline)
 
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("""
-            QTabWidget::pane { border: none; background: #faf7f0; }
-            QTabBar::tab { background: #f5f0e5; color: #8a8070; padding: 8px 24px;
+            QTabWidget::pane { border: none; background: #F2F5F4; }
+            QTabBar::tab { background: #E7EEEC; color: #6E7F83; padding: 10px 24px;
                 border: none; border-bottom: 2px solid transparent; font-size: 13px; }
-            QTabBar::tab:selected { background: #faf7f0; color: #c9a94e;
-                border-bottom: 2px solid #c9a94e; font-weight: bold; }
-            QTabBar::tab:hover { color: #2d2318; }
+            QTabBar::tab:selected { background: #F2F5F4; color: #167C78;
+                border-bottom: 2px solid #167C78; font-weight: 700; }
+            QTabBar::tab:hover { color: #14292F; }
+            QTabBar::tab:focus { border: 2px solid #167C78; }
         """)
-        self.setCentralWidget(self.tabs)
+        central_layout.addWidget(self.tabs, 1)
 
         # ── Tab 0: 日志（首页） ──
         self.log_tab = LogTab()
@@ -873,6 +1065,7 @@ class MainWindow(QMainWindow):
         # ── Tab 1: 偏好设置 ──
         self.settings_tab = SettingsTab()
         self.settings_tab.hotkey_changed.connect(self._on_hotkey_changed)
+        self.settings_tab.server_changed.connect(self._update_security_chip)
 
         # ── Tab 2: 关于 ──
         self.about_tab = AboutTab()
@@ -888,21 +1081,57 @@ class MainWindow(QMainWindow):
         self.status.showMessage(f"就绪  |  按 {_current_hotkey.upper()} 截图")
 
         # 窗口显示后启动热键轮询
-        QTimer.singleShot(200, self._start_hotkey_timer)
-        # Optional background work: a failed release check never affects use.
-        QTimer.singleShot(1000, self._check_for_update)
-
-        # 预加载 OCR 模型（后台线程，GUI 无感）
-        threading.Thread(target=_preload_ocr, daemon=True).start()
+        if not _PREVIEW_MODE:
+            QTimer.singleShot(200, self._start_hotkey_timer)
+            # Optional background work: a failed release check never affects use.
+            QTimer.singleShot(1000, self._check_for_update)
+            # 预加载 OCR 模型（后台线程，GUI 无感）
+            threading.Thread(target=_preload_ocr, daemon=True).start()
 
         # 当前数据
         self.current_result = None
         self._current_shot = None
+        self._update_security_chip(API_BASE)
+        self._set_pipeline("idle", "就绪：等待本机截图")
+        if not _hotkey_registered and not _PREVIEW_MODE:
+            QTimer.singleShot(0, self._show_hotkey_fallback)
 
     # ── 偏好设置回调 ────────────────────────
 
     def _on_hotkey_changed(self, new_key: str):
         self.status.showMessage(f"热键已更新: {new_key.upper()}  |  截图识别")
+
+    def _show_hotkey_fallback(self):
+        self.status.showMessage("全局热键不可用 · 请在偏好设置中更换快捷键")
+        QMessageBox.information(
+            self,
+            "全局热键不可用",
+            "请在偏好设置中更换快捷键后重试。",
+        )
+
+    def _update_security_chip(self, api_base: str):
+        if normalize_api_base(api_base).startswith("https://"):
+            self.secure_chip.setText("HTTPS · 传输加密")
+        else:
+            self.secure_chip.setText("LOCAL · 本机开发")
+
+    def _set_pipeline(self, stage: str, message: str, *, error: bool = False):
+        stage_index = {"capture": 0, "ocr": 1, "upload": 2}.get(stage, -1)
+        for index, label in enumerate(self.pipeline_steps):
+            if error and index == stage_index:
+                state = "error"
+            elif stage_index >= 0 and index < stage_index:
+                state = "done"
+            elif index == stage_index:
+                state = "active"
+            elif stage == "done":
+                state = "done"
+            else:
+                state = "idle"
+            label.setProperty("state", state)
+            label.style().unpolish(label)
+            label.style().polish(label)
+        self.pipeline_message.setText(message)
 
     def _check_for_update(self):
         self._update_check_worker = UpdateCheckWorker()
@@ -927,6 +1156,7 @@ class MainWindow(QMainWindow):
     def _process_shot(self, file_path: str):
         self._current_shot = file_path
         self.status.showMessage("OCR 识别中...")
+        self._set_pipeline("ocr", "截图仅在本机进入 OCR 识别")
 
         self.worker = OcrWorker(file_path)
         self.worker.finished.connect(self.on_ocr_done)
@@ -935,6 +1165,7 @@ class MainWindow(QMainWindow):
 
     def on_ocr_done(self, result: dict):
         if not result.get("ok"):
+            self._set_pipeline("ocr", "本地识别失败，未上传任何行情", error=True)
             self.status.showMessage(f"OCR 失败: {result.get('error', 'unknown')}")
             Toast("提交失败", f"OCR 失败: {result.get('error', 'unknown')}", ok=False).show_at_corner()
             self._log_outcome("check_failed", f"OCR 失败: {result.get('error', 'unknown')}")
@@ -951,8 +1182,10 @@ class MainWindow(QMainWindow):
         ok, reasons = validate_result(result)
         if ok:
             self.status.showMessage("检查通过，自动提交中...")
+            self._set_pipeline("upload", "校验通过，正在通过安全连接上传")
             self.do_submit()
         else:
+            self._set_pipeline("ocr", "本地校验未通过，已阻止上传", error=True)
             self.status.showMessage("检查未通过，未提交")
             shown = reasons[:3]
             extra = f"（共{len(reasons)}个问题）" if len(reasons) > 3 else ""
@@ -960,6 +1193,7 @@ class MainWindow(QMainWindow):
             self._log_outcome("check_failed", "; ".join(reasons))
 
     def on_ocr_error(self, err_msg: str):
+        self._set_pipeline("ocr", "OCR 服务不可用，已阻止上传", error=True)
         self.status.showMessage(f"OCR 服务不可用: {err_msg}")
         Toast("提交失败", f"OCR 服务不可用: {err_msg}", ok=False).show_at_corner()
         self._log_outcome("check_failed", f"OCR 服务不可用: {err_msg}")
@@ -970,10 +1204,11 @@ class MainWindow(QMainWindow):
         """Auto-submit current OCR result. Called after validate_result passes."""
         if not self.current_result:
             return
-        # Defensive recheck: consent is required; SCM ID is optional.
-        if not is_upload_ready(_config.get("scm_id", ""), _config.get("privacy_agreed", False)):
+        # Explicit consent is required whether or not points metadata is present.
+        if not is_upload_ready(_config.get("scm_id"), _config.get("privacy_agreed", False)):
+            self._set_pipeline("upload", "未同意隐私政策，已阻止上传", error=True)
             self.status.showMessage("未同意隐私政策，已阻止上传")
-            Toast("已阻止上传", "请先在偏好设置中阅读并同意隐私政策", ok=False).show_at_corner()
+            Toast("已阻止上传", "请先设置 SCM ID 并同意隐私政策", ok=False).show_at_corner()
             return
 
         self.status.showMessage("提交中...")
@@ -988,37 +1223,43 @@ class MainWindow(QMainWindow):
 
     def on_submit_done(self, resp: dict):
         if resp.get("ok"):
+            self._set_pipeline("done", "安全上传完成，本地记录已更新")
             n = resp.get("upserted", 0)
             promoted = resp.get("promoted", 0)
             pending = resp.get("pending", 0)
-            pts = resp.get("points") or {}
-            credited = pts.get("credited", 0)
-            total = pts.get("total")
-            result_detail = f"已接收 {n} 条"
-            if pending:
-                result_detail += f"，{promoted} 条已更新行情，{pending} 条待确认或复核"
-            elif promoted:
-                result_detail += f"，{promoted} 条已更新行情"
-            if credited > 0 and total is not None:
-                points_detail = f"+{credited} 积分（本月 {total}）"
-            elif pts.get("note"):
-                points_detail = pts.get("note")
-            elif pts.get("noScmId"):
-                points_detail = "未填写 SCM ID，本次不计积分"
-            elif pts.get("duplicates") or pts.get("capped"):
-                points_detail = "本次未新增积分（重复记录或已达每日上限）"
+            if isinstance(promoted, int) and promoted > 0 and isinstance(pending, int) and pending > 0:
+                result_detail = f"已接收 {n} 条：{promoted} 条已公开，{pending} 条待审核"
+            elif isinstance(promoted, int) and promoted > 0:
+                result_detail = f"已接收 {n} 条，已通过一致性校验并公开"
             else:
-                points_detail = ""
-            self.status.showMessage(f"处理完成: {n} 条，{promoted} 条已更新行情")
-            toast_detail = result_detail + (f"\n{points_detail}" if points_detail else "")
+                result_detail = f"已接收 {n} 条，等待管理员审核"
+            points = resp.get("points") if isinstance(resp.get("points"), dict) else {}
+            credited = points.get("credited", 0)
+            if isinstance(credited, int) and credited > 0:
+                total = points.get("total")
+                points_detail = f"本次 +{credited} 积分"
+                if isinstance(total, int):
+                    points_detail += f"，本月共 {total} 积分"
+            elif points.get("note"):
+                points_detail = str(points["note"])
+            elif points.get("capped"):
+                points_detail = "今日积分已达上限"
+            elif points.get("duplicates"):
+                points_detail = "重复数据不计积分"
+            else:
+                points_detail = "本次未增加积分"
+            self.status.showMessage(f"处理完成: {n} 条")
+            toast_detail = result_detail + f"\n{points_detail}"
             Toast("上传处理完成", toast_detail).show_at_corner()
             self._log_outcome("success", toast_detail.replace("\n", "；"))
         else:
+            self._set_pipeline("upload", "服务器未接受本次数据", error=True)
             self.status.showMessage("提交失败")
             Toast("提交失败", resp.get("error", "未知错误"), ok=False).show_at_corner()
             self._log_outcome("submit_failed", resp.get("error", "未知错误"))
 
     def on_submit_error(self, err_msg: str):
+        self._set_pipeline("upload", "安全上传失败，请检查网络后重试", error=True)
         self.status.showMessage("提交失败（网络错误）")
         Toast("提交失败", f"网络错误: {err_msg}", ok=False).show_at_corner()
         self._log_outcome("submit_failed", f"网络错误: {err_msg}")
@@ -1031,7 +1272,7 @@ class MainWindow(QMainWindow):
         items = []
         if self.current_result:
             items = build_snapshot_items(self.current_result)
-        shot = os.path.relpath(self._current_shot, _BASE_DIR) if self._current_shot else ""
+        shot = f"screenshots/{Path(self._current_shot).name}" if self._current_shot else ""
         entry = {
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "status": status,
@@ -1060,25 +1301,34 @@ class MainWindow(QMainWindow):
                 return
             self._do_screenshot()
 
-    def _show_account_dialog(self):
-        FirstRunDialog(self).exec()
+    def _show_account_dialog(self, require_ready=False):
+        FirstRunDialog(self, require_ready=require_ready).exec()
 
     def _maybe_show_first_run(self):
-        """Show privacy settings on first run; SCM ID remains optional."""
-        if not is_upload_ready(_config.get("scm_id", ""), _config.get("privacy_agreed", False)):
-            FirstRunDialog(self).exec()
+        """Show privacy settings on first run."""
+        if not is_upload_ready(_config.get("scm_id"), _config.get("privacy_agreed", False)):
+            self._set_pipeline("capture", "请先设置 SCM ID 并同意隐私政策", error=True)
+            FirstRunDialog(self, require_ready=True).exec()
+            if is_upload_ready(_config.get("scm_id"), _config.get("privacy_agreed", False)):
+                self._set_pipeline("idle", "设置已保存，等待本机截图")
+                self.status.showMessage(f"就绪  |  按 {_current_hotkey.upper()} 截图")
 
     def _do_screenshot(self):
         """Capture screen via child process (GDI capture leaks ~20MB heap per
         shot in-process; a short-lived child returns it all to the OS)."""
-        # Consent gates capture/upload; SCM ID only controls points.
-        if not is_upload_ready(_config.get("scm_id", ""), _config.get("privacy_agreed", False)):
-            self.status.showMessage("未同意隐私政策，已阻止截图与上传")
-            Toast("已阻止上传", "请先阅读并同意隐私政策；SCM ID 可留空", ok=False).show_at_corner()
-            self._show_account_dialog()
+        # Consent gates capture/upload; SCM ID remains optional points metadata.
+        if not is_upload_ready(_config.get("scm_id"), _config.get("privacy_agreed", False)):
+            self.status.showMessage("请先设置 SCM ID 并同意隐私政策")
+            Toast("暂不可用", "请先设置 SCM ID 并同意隐私政策", ok=False).show_at_corner()
+            self._show_account_dialog(require_ready=True)
+            if is_upload_ready(_config.get("scm_id"), _config.get("privacy_agreed", False)):
+                self._set_pipeline("idle", "设置已保存，请再次按快捷键截图")
+                self.status.showMessage(f"设置已保存  |  按 {_current_hotkey.upper()} 截图")
             return
         _play_shutter()
-        path = os.path.join(SCREENSHOT_DIR, time.strftime("sc_shot_%Y%m%d_%H%M%S.png"))
+        self._set_pipeline("capture", "正在截取本机画面")
+        file_name = time.strftime("sc_shot_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8] + ".png"
+        path = os.path.join(SCREENSHOT_DIR, file_name)
         if getattr(sys, 'frozen', False):
             cap_cmd = [os.path.join(os.path.dirname(sys.executable), "FT-Capture.exe"), path]
         else:
@@ -1088,6 +1338,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         if not os.path.exists(path):
+            self._set_pipeline("capture", "截图失败，未进入识别流程", error=True)
             self.status.showMessage("截图失败")
             return
         _make_thumbnail(path)
@@ -1097,19 +1348,36 @@ class MainWindow(QMainWindow):
         event.accept()
 
 # ════════════════ 入口 ════════════════
+def _configure_application_font(app: QApplication):
+    """Prefer the website font, with a guaranteed Windows Chinese fallback."""
+    families = set(QFontDatabase.families())
+    for font_path in (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\msyhbd.ttc"):
+        if not ({"Noto Sans SC", "Microsoft YaHei UI", "Microsoft YaHei"} & families):
+            font_id = QFontDatabase.addApplicationFont(font_path)
+            if font_id >= 0:
+                families.update(QFontDatabase.applicationFontFamilies(font_id))
+    family = next(
+        (name for name in ("Noto Sans SC", "Microsoft YaHei UI", "Microsoft YaHei") if name in families),
+        app.font().family(),
+    )
+    font = QFont(family, 10)
+    font.setStyleHint(QFont.StyleHint.SansSerif)
+    app.setFont(font)
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("泛天贸易中心")
     logo_path = _asset_path("logo.png")
     if os.path.exists(logo_path):
         app.setWindowIcon(QIcon(logo_path))
-    font = QFont("Microsoft YaHei", 10)
-    app.setFont(font)
+    _configure_application_font(app)
 
     window = MainWindow()
     window.show()
     # First-run privacy prompt; capture/upload remains blocked until consent.
-    QTimer.singleShot(0, window._maybe_show_first_run)
+    if not _PREVIEW_MODE:
+        QTimer.singleShot(0, window._maybe_show_first_run)
 
     sys.exit(app.exec())
 

@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import history
@@ -58,6 +59,82 @@ def test_append_caps_entries():
     assert entries[0]["time"] == "59"   # 最新在前
     assert entries[-1]["time"] == str(60 - history.MAX_ENTRIES)
     os.remove(p)
+
+
+def test_pruning_never_deletes_absolute_or_parent_traversal_paths():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        screenshots = root / "screenshots"
+        screenshots.mkdir()
+        victim = root / "victim.txt"
+        victim.write_text("keep", encoding="utf-8")
+        path = root / "history.json"
+        malicious = [
+            {"time": "absolute", "screenshot": str(victim)},
+            {"time": "traversal", "screenshot": "screenshots/../victim.txt"},
+        ]
+        path.write_text(json.dumps({"entries": [{}] * 48 + malicious}), encoding="utf-8")
+        history.append_entry({"time": "new"}, path, screenshot_dir=screenshots)
+        history.append_entry({"time": "newer"}, path, screenshot_dir=screenshots)
+        assert victim.read_text(encoding="utf-8") == "keep"
+
+
+def test_pruning_deletes_only_named_screenshot_and_thumbnail_inside_root():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        screenshots = root / "screenshots"
+        screenshots.mkdir()
+        shot = screenshots / "sc_shot_20260823_120000.png"
+        thumb = screenshots / "sc_shot_20260823_120000_thumb.png"
+        shot.write_bytes(b"shot")
+        thumb.write_bytes(b"thumb")
+        path = root / "history.json"
+        old = {"time": "old", "screenshot": f"screenshots/{shot.name}"}
+        path.write_text(json.dumps({"entries": [{}] * 49 + [old]}), encoding="utf-8")
+        history.append_entry({"time": "new"}, path, screenshot_dir=screenshots)
+        assert not shot.exists()
+        assert not thumb.exists()
+
+
+def test_clear_history_removes_records_and_dedicated_images_only():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        screenshots = root / "screenshots"
+        screenshots.mkdir()
+        shot = screenshots / "sc_shot_20260823_120000.png"
+        shot.write_bytes(b"shot")
+        unrelated = root / "keep.txt"
+        unrelated.write_text("keep", encoding="utf-8")
+        path = root / "history.json"
+        history.append_entry(
+            {"time": "now", "screenshot": f"screenshots/{shot.name}"},
+            path,
+            screenshot_dir=screenshots,
+        )
+        assert history.clear_entries(path, screenshot_dir=screenshots) == 1
+        assert history.load_entries(path) == []
+        assert not shot.exists()
+        assert unrelated.exists()
+
+
+def test_pruning_rejects_screenshot_symlink_when_supported():
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        screenshots = root / "screenshots"
+        screenshots.mkdir()
+        victim = root / "victim.txt"
+        victim.write_text("keep", encoding="utf-8")
+        link = screenshots / "sc_shot_20260823_120000.png"
+        try:
+            os.symlink(victim, link)
+        except (OSError, NotImplementedError):
+            return
+        path = root / "history.json"
+        old = {"screenshot": f"screenshots/{link.name}"}
+        path.write_text(json.dumps({"entries": [{}] * 49 + [old]}), encoding="utf-8")
+        history.append_entry({"time": "new"}, path, screenshot_dir=screenshots)
+        assert victim.read_text(encoding="utf-8") == "keep"
+        assert link.exists()
 
 
 if __name__ == "__main__":

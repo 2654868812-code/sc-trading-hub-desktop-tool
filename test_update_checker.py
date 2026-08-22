@@ -7,9 +7,12 @@ from update_checker import DATA_COLLECTION_URL, check_for_update, is_newer_versi
 
 
 class Response:
-    def __init__(self, payload, ok=True):
+    def __init__(self, payload, ok=True, url=None):
         self.payload = payload
         self.ok = ok
+        self.url = url
+        self.status_code = 200 if ok else 500
+        self.history = []
 
     def raise_for_status(self):
         if not self.ok:
@@ -30,12 +33,20 @@ def test_semver_comparison_accepts_newer_stable_releases_only():
 def test_update_check_uses_public_release_endpoint_and_never_downloads():
     requested = []
 
-    def get(url, timeout):
-        requested.append((url, timeout))
-        return Response({"available": True, "release": {"version": "1.4.0"}})
+    def get(url, **kwargs):
+        requested.append((url, kwargs))
+        return Response({"available": True, "release": {"version": "1.4.0"}}, url=url)
 
     assert check_for_update("https://example.test/", "1.3.0", get) == "1.4.0"
-    assert requested == [("https://example.test/api/desktop-release", 4)]
+    assert requested == [(
+        "https://example.test/api/desktop-release",
+        {
+            "headers": {"Accept": "application/json"},
+            "timeout": 4,
+            "allow_redirects": False,
+            "verify": True,
+        },
+    )]
     assert DATA_COLLECTION_URL == "https://fantiantradinghub.xyz/data-collection"
 
 

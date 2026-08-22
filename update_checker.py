@@ -8,6 +8,8 @@ import re
 
 import requests
 
+from transport_security import secure_get_json
+
 
 DATA_COLLECTION_URL = "https://fantiantradinghub.xyz/data-collection"
 _SEMVER_RE = re.compile(
@@ -48,9 +50,12 @@ def check_for_update(api_base: str, installed_version: str, http_get=requests.ge
     is optional and must never affect desktop startup or uploads.
     """
     try:
-        response = http_get(f"{api_base.rstrip('/')}/api/desktop-release", timeout=4)
-        response.raise_for_status()
-        data = response.json()
+        data = secure_get_json(
+            api_base,
+            "/api/desktop-release",
+            timeout=4,
+            http_get=http_get,
+        )
         release = data.get("release") if isinstance(data, dict) else None
         version = release.get("version") if data.get("available") is True and isinstance(release, dict) else None
         return version if is_newer_version(version, installed_version) else None

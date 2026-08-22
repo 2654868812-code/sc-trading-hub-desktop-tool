@@ -70,7 +70,10 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
-    uac_admin=True,
+    # The GUI handles only user-owned screenshots and network requests. Running
+    # the entire application elevated turns replaceable bundled files into an
+    # administrator-code execution path, so it must remain a standard-user app.
+    uac_admin=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

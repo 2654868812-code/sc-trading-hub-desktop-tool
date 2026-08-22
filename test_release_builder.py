@@ -46,7 +46,7 @@ def test_release_archive_emits_importable_metadata_and_checksum():
 
 
 def test_release_builder_uses_the_application_contract_version():
-    assert APP_VERSION == "1.3.0"
+    assert APP_VERSION == "1.4.0"
 
 
 def test_release_builder_rejects_invalid_version_and_empty_distribution():

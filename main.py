@@ -10,6 +10,7 @@ import sys
 import time
 import threading
 import winsound
+import uuid
 
 import requests
 from PyQt6.QtWidgets import (
@@ -19,8 +20,8 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QListView, QComboBox, QCheckBox,
     QTextBrowser, QDialog
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QPixmap, QFont, QPainter, QColor, QPen, QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl
+from PyQt6.QtGui import QPixmap, QFont, QPainter, QColor, QPen, QIcon, QDesktopServices
 
 # ════════════════ F3 Hotkey ════════════════
 # Anti-cheat safe (EAC/BattlEye compatible):
@@ -53,6 +54,7 @@ from upload_contract import (
     build_snapshot_payload,
     is_upload_ready,
 )
+from update_checker import DATA_COLLECTION_URL, check_for_update
 
 # ════════════════ Config ════════════════
 # onefile 打包后 __file__ 指向临时解压目录，配置/截图必须放 exe 旁边
@@ -97,6 +99,9 @@ def _save_config(cfg: dict):
 _config = _load_config()
 _config.setdefault("scm_id", "")
 _config.setdefault("privacy_agreed", False)
+if not _config.get("device_id"):
+    _config["device_id"] = str(uuid.uuid4())
+    _save_config(_config)
 _current_hotkey = _config.get("hotkey", "f3")
 
 _trigger_event = threading.Event()
@@ -247,6 +252,14 @@ class SubmitWorker(QThread):
             self.finished.emit(resp.json())
         except Exception as e:
             self.error.emit(str(e))
+
+
+class UpdateCheckWorker(QThread):
+    """Fetch the public release record without blocking the UI thread."""
+    finished = pyqtSignal(str)
+
+    def run(self):
+        self.finished.emit(check_for_update(API_BASE, APP_VERSION) or "")
 
 
 # ════════════════ Toast 通知气泡 ════════════════
@@ -546,10 +559,10 @@ class SettingsTab(QWidget):
         layout.addWidget(self.server_combo)
 
         layout.addSpacing(12)
-        layout.addWidget(QLabel("账号与隐私"))
+        layout.addWidget(QLabel("积分账号与隐私"))
 
         account_btn_row = QHBoxLayout()
-        account_btn = QPushButton("修改账号 ID / 查看隐私政策")
+        account_btn = QPushButton("设置可选 SCM ID / 查看隐私政策")
         account_btn.clicked.connect(lambda: self.show_privacy.emit())
         account_btn_row.addWidget(account_btn)
         account_btn_row.addStretch()
@@ -609,18 +622,21 @@ class SettingsTab(QWidget):
 _PRIVACY_HTML = """
 <h3 style="color:#c9a94e;">隐私政策</h3>
 <p><b>一、我们收集哪些信息</b></p>
-<p>1. 您主动填写的 SCM 账号 ID（仅用于积分统计，并非登录凭证，服务器不做身份核验）；</p>
-<p>2. 您按 {hotkey} 上传的游戏截图及从截图中识别出的商品数据（商品名、买卖类型、价格、库存、所在终端）；</p>
-<p>3. 请求来源 IP（服务安全与滥用防护）。</p>
+<p>1. 从您按 {hotkey} 主动截取的交易终端画面中识别出的结构化数据（终端、商品、买卖类型、价格和库存）；</p>
+<p>2. 桌面助手版本号与本机随机生成的设备标识（仅用于版本兼容、上传限流、重复检测和多来源确认，不用于确认真实身份）；</p>
+<p>3. 您选择填写的 SCM ID（可留空，仅用于把积分关联到已在网站登录过的账号，并非登录凭证，服务器不据此核验身份）；</p>
+<p>4. 请求来源 IP（服务安全与滥用防护）。</p>
+<p><b>截图说明：</b>截图与上传历史保存在本机程序目录，用于识别和本地回看；截图不会随行情数据上传，您可自行删除本地文件。</p>
 <p><b>二、我们如何使用信息</b></p>
-<p>1. 价格数据用于在泛天贸易中心网站公开分享，完善全站行情；</p>
-<p>2. 按上传条数累计积分：每条成功上传的商品 +1 分，每账号每日上限 100 分，10 分钟内重复内容不重复计分；</p>
+<p>1. 行情数据会经过格式校验、异常筛选和必要的多来源确认；通过规则的数据更新公开行情，待确认或隔离的数据留待系统或管理员复核；</p>
+<p>2. 若填写的 SCM ID 对应已注册账号，符合计分条件的记录每条 +1 分，每账号每日最多 100 分，10 分钟内重复内容不重复计分；</p>
 <p>3. 积分仅作上传激励统计，不构成任何兑换承诺。</p>
 <p><b>三、信息存储</b></p>
-<p>数据存储于中华人民共和国境内的服务器；积分与您填写的 SCM 账号 ID 关联。SCM 账号 ID 由您自行填写，请勿填写他人账号。</p>
+<p>结构化行情、审核记录与必要的来源信息存储于中华人民共和国境内的服务器。公开行情不会显示设备标识、来源 IP 或您填写的 SCM ID。请勿填写他人的 SCM ID。</p>
 <p><b>四、您的权利</b></p>
-<p>取消勾选同意后，本工具将停止上传；已上传的历史数据保留用于价格统计。如需删除您的信息，请联系下方渠道。</p>
+<p>您可以在“偏好设置 → 设置可选 SCM ID / 查看隐私政策”中撤回同意；撤回后工具将停止截图与上传。已提交的行情和审核记录可能在去除账号关联后继续保留。如需查询、更正或删除个人信息，请联系下方渠道。</p>
 <p>联系方式：QQ 群 1083464126</p>
+<p style="color:#8a8070;font-size:11px;">最后更新：2026 年 8 月 22 日</p>
 """
 
 _LICENSES_HTML = """
@@ -671,7 +687,7 @@ class AboutTab(QWidget):
                 logo_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
                 layout.addWidget(logo_label)
 
-        title = QLabel("泛天贸易中心 数据上传工具")
+        title = QLabel("泛天贸易中心桌面助手")
         title.setObjectName("title")
         title.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         layout.addWidget(title)
@@ -697,11 +713,11 @@ class AboutTab(QWidget):
 
 
 class FirstRunDialog(QDialog):
-    """首次使用/修改账号：填 SCM 账号 ID + 同意隐私政策后才能使用插件。"""
+    """Configure optional points ID and upload consent."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("账号设置 - 泛天贸易中心")
+        self.setWindowTitle("上传与隐私设置 - 泛天贸易中心")
         self.setModal(True)
         self.setFixedWidth(420)
         self.setStyleSheet("""
@@ -725,19 +741,19 @@ class FirstRunDialog(QDialog):
         layout.setSpacing(10)
         layout.setContentsMargins(20, 16, 20, 16)
 
-        title = QLabel("欢迎使用泛天贸易中心数据上传工具")
+        title = QLabel("欢迎使用泛天贸易中心桌面助手")
         title.setObjectName("title")
         layout.addWidget(title)
 
-        hint = QLabel("使用前请填写你的 SCM 账号 ID 并同意隐私政策。\n"
-                      "SCM 账号 ID 仅用于上传积分统计，并非登录凭证。")
+        hint = QLabel("上传前请阅读隐私政策并选择是否同意。\n"
+                      "SCM ID 可留空；如需积分，请填写网站头像菜单中显示的 SCM ID。")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        layout.addWidget(QLabel("SCM 账号 ID"))
+        layout.addWidget(QLabel("SCM ID（可选，仅用于积分）"))
         self.scm_id_edit = QLineEdit()
-        self.scm_id_edit.setPlaceholderText("填写你的 SCM 账号 ID")
+        self.scm_id_edit.setPlaceholderText("不需要积分可留空")
         self.scm_id_edit.setText(_config.get("scm_id", ""))
         layout.addWidget(self.scm_id_edit)
 
@@ -757,7 +773,7 @@ class FirstRunDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self.confirm_btn = QPushButton("开始使用")
+        self.confirm_btn = QPushButton("保存设置")
         self.confirm_btn.setObjectName("confirmBtn")
         self.confirm_btn.setEnabled(False)
         self.confirm_btn.clicked.connect(self._confirm)
@@ -769,8 +785,8 @@ class FirstRunDialog(QDialog):
         self._update_confirm()
 
     def _update_confirm(self):
-        ready = bool(self.scm_id_edit.text().strip()) and self.privacy_check.isChecked()
-        self.confirm_btn.setEnabled(ready)
+        # SCM ID is optional, and keeping this enabled lets users withdraw consent.
+        self.confirm_btn.setEnabled(True)
 
     def _show_policy(self):
         dlg = QDialog(self)
@@ -792,14 +808,8 @@ class FirstRunDialog(QDialog):
 
     def _confirm(self):
         scm_id = self.scm_id_edit.text().strip()
-        if not scm_id:
-            QMessageBox.warning(self, "提示", "请填写 SCM 账号 ID")
-            return
-        if not self.privacy_check.isChecked():
-            QMessageBox.warning(self, "提示", "请先阅读并同意隐私政策")
-            return
         _config["scm_id"] = scm_id
-        _config["privacy_agreed"] = True
+        _config["privacy_agreed"] = self.privacy_check.isChecked()
         _save_config(_config)
         self.accept()
 
@@ -879,6 +889,8 @@ class MainWindow(QMainWindow):
 
         # 窗口显示后启动热键轮询
         QTimer.singleShot(200, self._start_hotkey_timer)
+        # Optional background work: a failed release check never affects use.
+        QTimer.singleShot(1000, self._check_for_update)
 
         # 预加载 OCR 模型（后台线程，GUI 无感）
         threading.Thread(target=_preload_ocr, daemon=True).start()
@@ -891,6 +903,24 @@ class MainWindow(QMainWindow):
 
     def _on_hotkey_changed(self, new_key: str):
         self.status.showMessage(f"热键已更新: {new_key.upper()}  |  截图识别")
+
+    def _check_for_update(self):
+        self._update_check_worker = UpdateCheckWorker()
+        self._update_check_worker.finished.connect(self._show_update_notice)
+        self._update_check_worker.start()
+
+    def _show_update_notice(self, version: str):
+        if not version:
+            return
+        answer = QMessageBox.question(
+            self,
+            "发现新版本",
+            f"发现泛天数据上传工具 v{version}，是否前往数据采集页查看更新方式？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl(DATA_COLLECTION_URL))
 
     # ── OCR 处理 ──────────────────────────
 
@@ -940,16 +970,17 @@ class MainWindow(QMainWindow):
         """Auto-submit current OCR result. Called after validate_result passes."""
         if not self.current_result:
             return
-        # 防御性复查（正常在 _do_screenshot 已拦）：SCM ID 或隐私同意缺失不上传
+        # Defensive recheck: consent is required; SCM ID is optional.
         if not is_upload_ready(_config.get("scm_id", ""), _config.get("privacy_agreed", False)):
-            self.status.showMessage("未配置 SCM 账号或未同意隐私政策，已阻止上传")
-            Toast("已阻止上传", "请先填写 SCM 账号 ID 并同意隐私政策（偏好设置 → 修改账号 ID）", ok=False).show_at_corner()
+            self.status.showMessage("未同意隐私政策，已阻止上传")
+            Toast("已阻止上传", "请先在偏好设置中阅读并同意隐私政策", ok=False).show_at_corner()
             return
 
         self.status.showMessage("提交中...")
         self.worker2 = SubmitWorker(build_snapshot_payload(
             self.current_result,
             _config.get("scm_id", ""),
+            _config.get("device_id", ""),
         ))
         self.worker2.finished.connect(self.on_submit_done)
         self.worker2.error.connect(self.on_submit_error)
@@ -958,22 +989,30 @@ class MainWindow(QMainWindow):
     def on_submit_done(self, resp: dict):
         if resp.get("ok"):
             n = resp.get("upserted", 0)
+            promoted = resp.get("promoted", 0)
+            pending = resp.get("pending", 0)
             pts = resp.get("points") or {}
             credited = pts.get("credited", 0)
             total = pts.get("total")
+            result_detail = f"已接收 {n} 条"
+            if pending:
+                result_detail += f"，{promoted} 条已更新行情，{pending} 条待确认或复核"
+            elif promoted:
+                result_detail += f"，{promoted} 条已更新行情"
             if credited > 0 and total is not None:
-                self.status.showMessage(f"提交成功: {n} 条，+{credited} 积分")
-                Toast("提交成功", f"已提交 {n} 条\n+{credited} 积分（当前 {total}）").show_at_corner()
-                self._log_outcome("success", f"已提交 {n} 条，+{credited} 积分（当前 {total}）")
+                points_detail = f"+{credited} 积分（本月 {total}）"
             elif pts.get("note"):
-                # 数据已写入但无积分（未注册/去重/超限等），金色成功框附说明
-                self.status.showMessage(f"提交成功: {n} 条")
-                Toast("提交成功", f"已提交 {n} 条\n{pts.get('note')}").show_at_corner()
-                self._log_outcome("success", f"已提交 {n} 条（{pts.get('note')}）")
+                points_detail = pts.get("note")
+            elif pts.get("noScmId"):
+                points_detail = "未填写 SCM ID，本次不计积分"
+            elif pts.get("duplicates") or pts.get("capped"):
+                points_detail = "本次未新增积分（重复记录或已达每日上限）"
             else:
-                self.status.showMessage(f"提交成功: {n} 条")
-                Toast("提交成功", f"已提交 {n} 条数据").show_at_corner()
-                self._log_outcome("success", f"已提交 {n} 条")
+                points_detail = ""
+            self.status.showMessage(f"处理完成: {n} 条，{promoted} 条已更新行情")
+            toast_detail = result_detail + (f"\n{points_detail}" if points_detail else "")
+            Toast("上传处理完成", toast_detail).show_at_corner()
+            self._log_outcome("success", toast_detail.replace("\n", "；"))
         else:
             self.status.showMessage("提交失败")
             Toast("提交失败", resp.get("error", "未知错误"), ok=False).show_at_corner()
@@ -1025,17 +1064,17 @@ class MainWindow(QMainWindow):
         FirstRunDialog(self).exec()
 
     def _maybe_show_first_run(self):
-        """首次使用：未填账号 ID 或未同意隐私政策时弹账号设置，无法跳过才能用。"""
+        """Show privacy settings on first run; SCM ID remains optional."""
         if not is_upload_ready(_config.get("scm_id", ""), _config.get("privacy_agreed", False)):
             FirstRunDialog(self).exec()
 
     def _do_screenshot(self):
         """Capture screen via child process (GDI capture leaks ~20MB heap per
         shot in-process; a short-lived child returns it all to the OS)."""
-        # 门禁：未填 SCM 账号 ID 或未同意隐私政策时阻止上传
+        # Consent gates capture/upload; SCM ID only controls points.
         if not is_upload_ready(_config.get("scm_id", ""), _config.get("privacy_agreed", False)):
-            self.status.showMessage("未配置 SCM 账号或未同意隐私政策，已阻止上传")
-            Toast("已阻止上传", "请先填写 SCM 账号 ID 并同意隐私政策（偏好设置 → 修改账号 ID）", ok=False).show_at_corner()
+            self.status.showMessage("未同意隐私政策，已阻止截图与上传")
+            Toast("已阻止上传", "请先阅读并同意隐私政策；SCM ID 可留空", ok=False).show_at_corner()
             self._show_account_dialog()
             return
         _play_shutter()
@@ -1069,7 +1108,7 @@ def main():
 
     window = MainWindow()
     window.show()
-    # 首次使用强制账号设置（弹窗结束后才进入主流程；F3 门禁同时兜底）
+    # First-run privacy prompt; capture/upload remains blocked until consent.
     QTimer.singleShot(0, window._maybe_show_first_run)
 
     sys.exit(app.exec())

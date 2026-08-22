@@ -39,10 +39,14 @@ jobs:
       - name: Test upload contract
         run: python test_upload_contract.py
 
+      - name: Test release packaging metadata
+        run: python test_release_builder.py
+
       - name: Compile core Python files
         run: >-
           python -m py_compile
           main.py
           upload_contract.py
+          build_release.py
           history.py
           capture_main.py

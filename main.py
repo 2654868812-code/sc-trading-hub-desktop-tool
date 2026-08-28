@@ -764,9 +764,9 @@ _LICENSES_HTML = """
 <tr><td style="border-bottom:1px solid #CFDAD7;">NumPy</td><td style="border-bottom:1px solid #CFDAD7;">BSD-3-Clause</td><td style="border-bottom:1px solid #CFDAD7;">数值计算</td></tr>
 <tr><td>PyInstaller</td><td>GPL（bootloader 例外）</td><td>构建期组件，未随程序分发</td></tr>
 </table>
-<p style="margin-top:10px;"><b>GPL 声明：</b>本工具包含 GPL-3.0 许可的 PyQt6（本工具唯一的 GPL 运行时组件）。
-依据 GPL 条款，向接收者分发本工具需提供获取完整源代码的途径——如您需要源码副本，
-请联系 QQ 群 1083464126。</p>
+<p style="margin-top:10px;"><b>GPL 声明：</b>本工具整体依据 GNU GPL 第 3 版发布，完整许可文本随安装包提供。
+与当前二进制版本精确对应的 <code>FT-DataUpload-v版本号-source.zip</code>、构建说明和 SHA-256
+在 QQ 群 1083464126 的同一文件区同步提供，获取源码不收取额外费用，也不设置高于二进制包的访问条件。</p>
 """
 
 class AboutTab(QWidget):

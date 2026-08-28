@@ -70,10 +70,9 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
-    # The GUI handles only user-owned screenshots and network requests. Running
-    # the entire application elevated turns replaceable bundled files into an
-    # administrator-code execution path, so it must remain a standard-user app.
-    uac_admin=False,
+    # Star Citizen may run elevated. Match its integrity level so Windows UIPI
+    # does not block the global capture hotkey while the game has focus.
+    uac_admin=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

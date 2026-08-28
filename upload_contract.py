@@ -3,16 +3,21 @@
 import re
 
 APP_VERSION = "1.5.0"
+PRIVACY_POLICY_VERSION = "2026-08-28"
 _DEVICE_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
     re.IGNORECASE,
 )
 
 
-def is_upload_ready(scm_id, privacy_agreed):
-    """The desktop workflow requires both an SCM ID and explicit consent."""
+def is_upload_ready(scm_id, privacy_agreed, privacy_policy_version):
+    """Require an SCM ID and explicit consent to the current policy version."""
     try:
-        return privacy_agreed is True and bool(normalize_scm_id(scm_id))
+        return (
+            privacy_agreed is True
+            and privacy_policy_version == PRIVACY_POLICY_VERSION
+            and bool(normalize_scm_id(scm_id))
+        )
     except ValueError:
         return False
 

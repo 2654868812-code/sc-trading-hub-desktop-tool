@@ -5,6 +5,7 @@ import traceback
 
 from upload_contract import (
     APP_VERSION,
+    PRIVACY_POLICY_VERSION,
     build_snapshot_items,
     build_snapshot_payload,
     is_valid_device_id,
@@ -21,12 +22,15 @@ def test_release_version_matches_backend_gate():
 
 
 def test_upload_gate_requires_scm_id_and_explicit_consent():
-    assert is_upload_ready("player-123", True) is True
-    assert is_upload_ready("  ", True) is False
-    assert is_upload_ready("", True) is False
-    assert is_upload_ready("player-123", False) is False
-    assert is_upload_ready("player-123", 1) is False
-    assert is_upload_ready("x" * 101, True) is False
+    assert PRIVACY_POLICY_VERSION == "2026-08-28"
+    assert is_upload_ready("player-123", True, PRIVACY_POLICY_VERSION) is True
+    assert is_upload_ready("player-123", True, "2026-08-23") is False
+    assert is_upload_ready("player-123", True, "") is False
+    assert is_upload_ready("  ", True, PRIVACY_POLICY_VERSION) is False
+    assert is_upload_ready("", True, PRIVACY_POLICY_VERSION) is False
+    assert is_upload_ready("player-123", False, PRIVACY_POLICY_VERSION) is False
+    assert is_upload_ready("player-123", 1, PRIVACY_POLICY_VERSION) is False
+    assert is_upload_ready("x" * 101, True, PRIVACY_POLICY_VERSION) is False
 
 
 def test_snapshot_items_use_page_transaction_and_preserve_reliable_max_signal():

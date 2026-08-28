@@ -53,6 +53,7 @@ from app_storage import (
 import history
 from upload_contract import (
     APP_VERSION,
+    PRIVACY_POLICY_VERSION,
     build_snapshot_items,
     build_snapshot_payload,
     is_valid_device_id,
@@ -77,6 +78,7 @@ _API_DEFAULTS = {
     "hotkey": "f3",
     "api_base": "https://fantiantradinghub.xyz",
     "privacy_agreed": False,
+    "privacy_policy_version": "",
     "scm_id": "",
 }
 
@@ -100,6 +102,8 @@ def _load_config():
         except Exception:
             pass
         cfg["privacy_agreed"] = loaded.get("privacy_agreed") is True
+        if isinstance(loaded.get("privacy_policy_version"), str):
+            cfg["privacy_policy_version"] = loaded["privacy_policy_version"]
         try:
             cfg["scm_id"] = normalize_scm_id(loaded.get("scm_id"))
         except ValueError:
@@ -113,6 +117,7 @@ def _save_config(cfg: dict):
         "hotkey": cfg.get("hotkey", "f3"),
         "api_base": normalize_api_base(cfg.get("api_base", _API_DEFAULTS["api_base"])),
         "privacy_agreed": cfg.get("privacy_agreed") is True,
+        "privacy_policy_version": str(cfg.get("privacy_policy_version", "")),
         "scm_id": normalize_scm_id(cfg.get("scm_id")),
         "device_id": cfg.get("device_id", ""),
     }
@@ -120,6 +125,7 @@ def _save_config(cfg: dict):
 
 _config = _load_config()
 _config.setdefault("privacy_agreed", False)
+_config.setdefault("privacy_policy_version", "")
 if not is_valid_device_id(_config.get("device_id")):
     _config["device_id"] = str(uuid.uuid4())
 # Rewrite only the validated configuration subset on startup.
@@ -718,6 +724,8 @@ class SettingsTab(QWidget):
 # ════════════════ 关于 ════════════════
 _PRIVACY_HTML = """
 <h3 style="color:#167C78;">隐私政策</h3>
+<p><b>个人信息处理者：</b>与网站 ICP 备案主体一致，完整名称/姓名在
+<a href="https://fantiantradinghub.xyz/privacy">网站隐私政策</a>中实时公示。</p>
 <p><b>一、我们收集哪些信息</b></p>
 <p>1. 从您按 {hotkey} 主动截取的交易终端画面中识别出的结构化数据（终端、商品、买卖类型、价格和库存）；</p>
 <p>2. 桌面助手版本号与本机随机生成的设备标识（仅用于版本兼容、上传限流、重复检测和多来源确认，不用于确认真实身份）；</p>
@@ -726,12 +734,17 @@ _PRIVACY_HTML = """
 <p><b>二、我们如何使用信息</b></p>
 <p>1. 符合多来源一致性规则的行情可自动公开，来源不足或异常的数据等待管理员复核；</p>
 <p>2. 使用桌面助手必须填写 SCM ID 并同意本政策。SCM ID 仅用于匹配已注册账号并记录积分，不影响审核、限流或封禁。该 ID 由您手动填写，不能证明身份，请勿填写他人的 ID。</p>
-<p><b>三、信息存储</b></p>
-<p>结构化行情、审核记录与必要的来源信息存储于中华人民共和国境内的服务器。公开行情不会显示设备标识或来源 IP。</p>
-<p><b>四、您的权利</b></p>
-<p>您可以在“偏好设置 → 设置 SCM ID / 隐私”中修改 SCM ID 或撤回同意；撤回后工具将停止截图与上传。已提交的行情和审核记录可能继续保留。如需查询、更正或删除个人信息，请联系下方渠道。</p>
+<p><b>三、保存期限与安全日志</b></p>
+<p>结构化行情、审核记录与必要的来源信息存储于中华人民共和国境内的服务器。设备标识、SCM ID、来源 IP、审核证据及最小化安全日志保存 30 天，随后删除或不可逆匿名化；无法再识别个人的公开行情可作为价格历史长期保留。</p>
+<p>安全日志只记录 IP 地址、访问时间、请求路径和响应状态，不得记录请求正文、Cookie、Authorization 或任何密钥。公开行情不会显示设备标识、SCM ID 或来源 IP。</p>
+<p><b>四、您的权利与撤回同意</b></p>
+<p>您可以在“偏好设置 → 设置 SCM ID / 隐私”中修改 SCM ID 或撤回同意；撤回后工具将停止截图与上传，且不影响撤回前处理的效力。如需查询、复制、更正或删除个人信息，请联系下方渠道，我们将在 15 个工作日内处理。</p>
+<p><b>五、未成年人保护</b></p>
+<p>未满 14 周岁用户不得使用桌面助手的截图或行情上传功能，并应由监护人联系我们删除已提交的个人信息。</p>
+<p><b>六、政策更新</b></p>
+<p>若个人信息处理目的、方式或种类发生变化，我们会重新告知并取得您的同意，不以继续使用替代重新同意。本政策版本变化后，桌面助手会要求您再次确认。</p>
 <p>联系方式：QQ 群 1083464126</p>
-<p style="color:#6E7F83;font-size:11px;">最后更新：2026 年 8 月 23 日</p>
+<p style="color:#6E7F83;font-size:11px;">政策版本：2026-08-28</p>
 """
 
 _LICENSES_HTML = """
@@ -856,7 +869,13 @@ class FirstRunDialog(QDialog):
 
         agree_row = QHBoxLayout()
         self.privacy_check = QCheckBox("我已阅读并同意《隐私政策》")
-        self.privacy_check.setChecked(bool(_config.get("privacy_agreed", False)))
+        self.privacy_check.setChecked(
+            is_upload_ready(
+                _config.get("scm_id"),
+                _config.get("privacy_agreed", False),
+                _config.get("privacy_policy_version", ""),
+            )
+        )
         agree_row.addWidget(self.privacy_check)
         agree_row.addStretch()
         layout.addLayout(agree_row)
@@ -887,7 +906,11 @@ class FirstRunDialog(QDialog):
             self.confirm_btn.setEnabled(True)
             return
         self.confirm_btn.setEnabled(
-            is_upload_ready(self.scm_input.text(), self.privacy_check.isChecked())
+            is_upload_ready(
+                self.scm_input.text(),
+                self.privacy_check.isChecked(),
+                PRIVACY_POLICY_VERSION,
+            )
         )
 
     def _show_policy(self):
@@ -922,6 +945,9 @@ class FirstRunDialog(QDialog):
             return
         _config["scm_id"] = scm_id
         _config["privacy_agreed"] = self.privacy_check.isChecked()
+        _config["privacy_policy_version"] = (
+            PRIVACY_POLICY_VERSION if self.privacy_check.isChecked() else ""
+        )
         _save_config(_config)
         self.accept()
 
@@ -1205,7 +1231,11 @@ class MainWindow(QMainWindow):
         if not self.current_result:
             return
         # Explicit consent is required whether or not points metadata is present.
-        if not is_upload_ready(_config.get("scm_id"), _config.get("privacy_agreed", False)):
+        if not is_upload_ready(
+            _config.get("scm_id"),
+            _config.get("privacy_agreed", False),
+            _config.get("privacy_policy_version", ""),
+        ):
             self._set_pipeline("upload", "未同意隐私政策，已阻止上传", error=True)
             self.status.showMessage("未同意隐私政策，已阻止上传")
             Toast("已阻止上传", "请先设置 SCM ID 并同意隐私政策", ok=False).show_at_corner()
@@ -1306,10 +1336,18 @@ class MainWindow(QMainWindow):
 
     def _maybe_show_first_run(self):
         """Show privacy settings on first run."""
-        if not is_upload_ready(_config.get("scm_id"), _config.get("privacy_agreed", False)):
+        if not is_upload_ready(
+            _config.get("scm_id"),
+            _config.get("privacy_agreed", False),
+            _config.get("privacy_policy_version", ""),
+        ):
             self._set_pipeline("capture", "请先设置 SCM ID 并同意隐私政策", error=True)
             FirstRunDialog(self, require_ready=True).exec()
-            if is_upload_ready(_config.get("scm_id"), _config.get("privacy_agreed", False)):
+            if is_upload_ready(
+                _config.get("scm_id"),
+                _config.get("privacy_agreed", False),
+                _config.get("privacy_policy_version", ""),
+            ):
                 self._set_pipeline("idle", "设置已保存，等待本机截图")
                 self.status.showMessage(f"就绪  |  按 {_current_hotkey.upper()} 截图")
 
@@ -1317,11 +1355,19 @@ class MainWindow(QMainWindow):
         """Capture screen via child process (GDI capture leaks ~20MB heap per
         shot in-process; a short-lived child returns it all to the OS)."""
         # Consent gates capture/upload; SCM ID remains optional points metadata.
-        if not is_upload_ready(_config.get("scm_id"), _config.get("privacy_agreed", False)):
+        if not is_upload_ready(
+            _config.get("scm_id"),
+            _config.get("privacy_agreed", False),
+            _config.get("privacy_policy_version", ""),
+        ):
             self.status.showMessage("请先设置 SCM ID 并同意隐私政策")
             Toast("暂不可用", "请先设置 SCM ID 并同意隐私政策", ok=False).show_at_corner()
             self._show_account_dialog(require_ready=True)
-            if is_upload_ready(_config.get("scm_id"), _config.get("privacy_agreed", False)):
+            if is_upload_ready(
+                _config.get("scm_id"),
+                _config.get("privacy_agreed", False),
+                _config.get("privacy_policy_version", ""),
+            ):
                 self._set_pipeline("idle", "设置已保存，请再次按快捷键截图")
                 self.status.showMessage(f"设置已保存  |  按 {_current_hotkey.upper()} 截图")
             return

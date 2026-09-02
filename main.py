@@ -14,15 +14,15 @@ import uuid
 import re
 from pathlib import Path
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
     QSplitter, QStatusBar, QMessageBox, QLineEdit, QTabWidget,
     QListWidget, QListWidgetItem, QListView, QComboBox, QCheckBox,
     QTextBrowser, QDialog, QFrame
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl
-from PyQt6.QtGui import (
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QUrl
+from PySide6.QtGui import (
     QPixmap, QFont, QFontDatabase, QPainter, QColor, QPen, QIcon, QDesktopServices
 )
 
@@ -256,8 +256,8 @@ def _preload_ocr():
 
 # ════════════════ OCR Worker ════════════════
 class OcrWorker(QThread):
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
+    finished = Signal(dict)
+    error = Signal(str)
 
     def __init__(self, file_path: str):
         super().__init__()
@@ -279,8 +279,8 @@ class OcrWorker(QThread):
 
 
 class SubmitWorker(QThread):
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
+    finished = Signal(dict)
+    error = Signal(str)
 
     def __init__(self, data: dict):
         super().__init__()
@@ -300,7 +300,7 @@ class SubmitWorker(QThread):
 
 class UpdateCheckWorker(QThread):
     """Fetch the public release record without blocking the UI thread."""
-    finished = pyqtSignal(str)
+    finished = Signal(str)
 
     def run(self):
         self.finished.emit(check_for_update(API_BASE, APP_VERSION) or "")
@@ -520,7 +520,7 @@ class LogTab(QWidget):
 
 class HotkeyCaptureWidget(QLineEdit):
     """Read-only line edit that captures next key press as hotkey binding."""
-    key_captured = pyqtSignal(str)
+    key_captured = Signal(str)
 
     def __init__(self, current_key: str):
         super().__init__(f"当前: {current_key.upper()}  —  点击后按下新快捷键")
@@ -584,9 +584,9 @@ class HotkeyCaptureWidget(QLineEdit):
 
 class SettingsTab(QWidget):
     """Settings tab embedded in main window."""
-    hotkey_changed = pyqtSignal(str)
-    server_changed = pyqtSignal(str)
-    show_privacy = pyqtSignal()
+    hotkey_changed = Signal(str)
+    server_changed = Signal(str)
+    show_privacy = Signal()
 
     def __init__(self):
         super().__init__()
@@ -751,7 +751,7 @@ _LICENSES_HTML = """
 <h3 style="color:#167C78;">开源许可</h3>
 <p>本工具基于以下开源项目构建，特此致谢：</p>
 <table cellpadding="4" cellspacing="0" style="border-collapse:collapse;">
-<tr><td style="border-bottom:1px solid #CFDAD7;">PyQt6</td><td style="border-bottom:1px solid #CFDAD7;">GPL-3.0-only</td><td style="border-bottom:1px solid #CFDAD7;">界面框架</td></tr>
+<tr><td style="border-bottom:1px solid #CFDAD7;">PySide6 / Qt</td><td style="border-bottom:1px solid #CFDAD7;">LGPL-3.0</td><td style="border-bottom:1px solid #CFDAD7;">界面框架</td></tr>
 <tr><td style="border-bottom:1px solid #CFDAD7;">CnOCR</td><td style="border-bottom:1px solid #CFDAD7;">Apache-2.0</td><td style="border-bottom:1px solid #CFDAD7;">文字识别引擎</td></tr>
 <tr><td style="border-bottom:1px solid #CFDAD7;">CnStd</td><td style="border-bottom:1px solid #CFDAD7;">Apache-2.0</td><td style="border-bottom:1px solid #CFDAD7;">文本检测</td></tr>
 <tr><td style="border-bottom:1px solid #CFDAD7;">RapidOCR</td><td style="border-bottom:1px solid #CFDAD7;">Apache-2.0</td><td style="border-bottom:1px solid #CFDAD7;">OCR 模型（PP-OCRv6）</td></tr>
@@ -764,9 +764,9 @@ _LICENSES_HTML = """
 <tr><td style="border-bottom:1px solid #CFDAD7;">NumPy</td><td style="border-bottom:1px solid #CFDAD7;">BSD-3-Clause</td><td style="border-bottom:1px solid #CFDAD7;">数值计算</td></tr>
 <tr><td>PyInstaller</td><td>GPL（bootloader 例外）</td><td>构建期组件，未随程序分发</td></tr>
 </table>
-<p style="margin-top:10px;"><b>GPL 声明：</b>本工具整体依据 GNU GPL 第 3 版发布，完整许可文本随安装包提供。
-与当前二进制版本精确对应的 <code>FT-DataUpload-v版本号-source.zip</code>、构建说明和 SHA-256
-在 QQ 群 1083464126 的同一文件区同步提供，获取源码不收取额外费用，也不设置高于二进制包的访问条件。</p>
+<p style="margin-top:10px;"><b>软件许可边界：</b>泛天贸易中心桌面助手自身为专有软件。本工具使用 PySide6 与 Qt 的社区版本，相关库依据
+GNU LGPL 第 3 版提供。安装目录中的 Qt/PySide6 动态库保持为独立文件，您可以使用接口兼容的修改版本替换它们，
+也可以为调试这些修改进行必要的逆向工程。GNU GPL 第 3 版与 LGPL 第 3 版完整文本随安装包提供。</p>
 """
 
 class AboutTab(QWidget):

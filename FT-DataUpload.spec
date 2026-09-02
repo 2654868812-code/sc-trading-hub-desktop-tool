@@ -5,6 +5,20 @@ import os
 import cnocr
 from PyInstaller.utils.hooks import collect_data_files
 
+_gpl_only_qt_fragments = (
+    'canvaspainter', 'coap', 'graphs', 'grpc', 'httpserver', 'lottie', 'mqtt',
+    'networkauth', 'qmlcompiler', 'quick3d', 'quicktimeline',
+    'virtualkeyboard', 'waylandcompositor',
+)
+
+
+def _without_gpl_only_qt(entries):
+    """Do not distribute Qt modules that the community edition offers only under GPL."""
+    return [
+        entry for entry in entries
+        if not any(fragment in os.path.basename(entry[0]).lower() for fragment in _gpl_only_qt_fragments)
+    ]
+
 # SPECPATH is the directory containing this .spec file (provided by PyInstaller)
 _spec_dir = SPECPATH
 _ocr_dir = os.path.join(_spec_dir, '..', 'sc-trading-hub', 'ocr-service')
@@ -54,6 +68,8 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+a.binaries = _without_gpl_only_qt(a.binaries)
+a.datas = _without_gpl_only_qt(a.datas)
 pyz = PYZ(a.pure)
 
 exe = EXE(

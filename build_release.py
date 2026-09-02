@@ -12,6 +12,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZIP64_LIMIT, ZipFile
@@ -21,6 +23,10 @@ from upload_contract import APP_VERSION
 ROOT = Path(__file__).resolve().parent
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
 REQUIRED_EXECUTABLES = {"FT-DataUpload.exe", "FT-Capture.exe"}
+REQUIRED_QT_RUNTIME_FILES = {
+    "_internal/pyside6/qt6core.dll",
+    "_internal/pyside6/qt6widgets.dll",
+}
 ALLOWED_ROOT_DIRECTORY = "_internal"
 DENIED_NAMES = {
     "screenshots",
@@ -28,21 +34,49 @@ DENIED_NAMES = {
     "ft_upload_history.json",
 }
 EXTERNAL_ICU_PATTERN = re.compile(r"(?:icuuc|icudt\d+)\.dll", re.IGNORECASE)
-LEGAL_DOCUMENTS = ("COPYING", "SOURCE-BUILD.md", "THIRD-PARTY-NOTICES.md")
+GPL_ONLY_QT_FRAGMENTS = (
+    "canvaspainter",
+    "coap",
+    "graphs",
+    "grpc",
+    "httpserver",
+    "lottie",
+    "mqtt",
+    "networkauth",
+    "qmlcompiler",
+    "quick3d",
+    "quicktimeline",
+    "virtualkeyboard",
+    "waylandcompositor",
+)
+LEGAL_DOCUMENTS = (
+    ("COPYING", "licenses/GPL-3.0.txt"),
+    ("COPYING.LESSER", "licenses/LGPL-3.0.txt"),
+    ("QT-LGPL-SOURCE.md", "licenses/RELINKING.md"),
+    ("SOURCE-BUILD.md", "licenses/PRIVATE-BUILD-AUDIT.md"),
+    ("THIRD-PARTY-NOTICES.md", "licenses/THIRD-PARTY-NOTICES.md"),
+    ("UPSTREAM-SOURCES.json", "licenses/UPSTREAM-SOURCES.json"),
+)
+LEGAL_SOURCE_FILES = tuple(source for source, _destination in LEGAL_DOCUMENTS)
 DESKTOP_SOURCE_FILES = (
     "app_storage.py",
     "assets/logo.ico",
     "assets/logo.png",
     "build_release.py",
+    "build_installer.py",
+    "fetch_upstream_sources.py",
     "capture_main.py",
     "create_shortcut.py",
     "FT-DataUpload.spec",
+    "installer/FT-DataUpload.iss",
     "history.py",
     "main.py",
     "requirements.txt",
     "shutter.wav",
     "test_app_storage.py",
     "test_history.py",
+    "test_installer_builder.py",
+    "test_qt_migration.py",
     "test_release_builder.py",
     "test_transport_security.py",
     "test_update_checker.py",
@@ -50,7 +84,7 @@ DESKTOP_SOURCE_FILES = (
     "transport_security.py",
     "update_checker.py",
     "upload_contract.py",
-    *LEGAL_DOCUMENTS,
+    *LEGAL_SOURCE_FILES,
 )
 WEBSITE_SOURCE_FILES = (
     "ocr-service/server.py",
@@ -84,9 +118,13 @@ def _is_reparse_stat(info) -> bool:
 
 def _validate_name(relative: Path) -> None:
     lowered = [part.lower() for part in relative.parts]
+    if "pyqt6" in lowered:
+        raise ValueError(f"PyQt6 is not releasable under the LGPL build: {relative}")
     if any(part in DENIED_NAMES for part in lowered):
         raise ValueError(f"Sensitive runtime data is not releasable: {relative}")
     if len(relative.parts) > 1 and relative.parts[0] == ALLOWED_ROOT_DIRECTORY:
+        if "pyside6" in lowered and any(fragment in relative.name.lower() for fragment in GPL_ONLY_QT_FRAGMENTS):
+            raise ValueError(f"GPL-only Qt module is not releasable under the LGPL build: {relative}")
         if EXTERNAL_ICU_PATTERN.fullmatch(relative.name):
             raise ValueError(f"External ICU runtime is not releasable: {relative}")
     if relative.suffix.lower() == ".log":
@@ -112,6 +150,7 @@ def collect_release_files(source_dir: Path) -> list[tuple[Path, Path]]:
         raise FileNotFoundError(f"Desktop distribution is missing: {source_dir}")
     files: list[tuple[Path, Path]] = []
     found_executables: set[str] = set()
+    found_relative_files: set[str] = set()
 
     def visit(directory: Path) -> None:
         with os.scandir(directory) as entries:
@@ -130,6 +169,7 @@ def collect_release_files(source_dir: Path) -> list[tuple[Path, Path]]:
                     if len(relative.parts) == 1 and relative.name not in REQUIRED_EXECUTABLES:
                         raise ValueError(f"Unexpected release root file: {relative}")
                     files.append((path, relative))
+                    found_relative_files.add(relative.as_posix().lower())
                     if len(relative.parts) == 1:
                         found_executables.add(relative.name)
                 else:
@@ -143,6 +183,12 @@ def collect_release_files(source_dir: Path) -> list[tuple[Path, Path]]:
         )
     if not any(relative.parts[0] == ALLOWED_ROOT_DIRECTORY for _, relative in files):
         raise FileNotFoundError("Desktop runtime directory is empty or missing: _internal")
+    missing_qt = REQUIRED_QT_RUNTIME_FILES - found_relative_files
+    if missing_qt:
+        raise FileNotFoundError(
+            "Desktop distribution is missing required dynamic Qt runtime file(s): "
+            + ", ".join(sorted(missing_qt))
+        )
     return files
 
 
@@ -181,13 +227,38 @@ def sha256_file(file_path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def write_text_lf(path: Path, text: str) -> None:
+    """Write UTF-8 release control files with Linux-compatible LF endings."""
+    with Path(path).open("w", encoding="utf-8", newline="\n") as stream:
+        stream.write(text)
+
+
+@contextmanager
+def release_temporary_directory(prefix: str, parent: Path):
+    """Clean staging trees despite short-lived Windows malware-scanner locks."""
+    path = Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
+    try:
+        yield path
+    finally:
+        for attempt in range(5):
+            try:
+                shutil.rmtree(path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.25 * (2 ** attempt))
+
+
 def create_release_archive(
     source_dir: Path,
     output_dir: Path,
     version: str = APP_VERSION,
     generated_at: str | None = None,
+    *,
+    emit_metadata: bool = True,
 ) -> tuple[Path, Path, Path, Path, Path, dict]:
-    """Emit one binary/source release pair and their shared metadata."""
+    """Emit a portable package plus a private application build-source audit bundle."""
     source_dir = Path(source_dir)
     output_dir = output_dir.resolve()
     if not VERSION_PATTERN.fullmatch(version):
@@ -198,20 +269,23 @@ def create_release_archive(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_path = output_dir / f"FT-DataUpload-v{version}.zip"
-    source_archive_path = output_dir / f"FT-DataUpload-v{version}-source.zip"
-    metadata_path = output_dir / "release-info.json"
+    private_dir = output_dir / "private"
+    private_dir.mkdir(parents=True, exist_ok=True)
+    source_archive_path = private_dir / f"FT-DataUpload-v{version}-private-build-source.zip"
+    metadata_path = private_dir / "build-audit-info.json"
     checksum_path = output_dir / f"FT-DataUpload-v{version}.sha256.txt"
-    source_checksum_path = output_dir / f"FT-DataUpload-v{version}-source.sha256.txt"
+    source_checksum_path = private_dir / f"FT-DataUpload-v{version}-private-build-source.sha256.txt"
 
-    with tempfile.TemporaryDirectory(prefix=".release-staging-", dir=output_dir) as temp:
-        temp_root = Path(temp)
+    with release_temporary_directory(".release-staging-", output_dir) as temp_root:
         staged_source = temp_root / "FT-DataUpload"
         for file_path, relative in release_files:
             destination = staged_source / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(file_path, destination)
-        for document_name in LEGAL_DOCUMENTS:
-            shutil.copyfile(ROOT / document_name, staged_source / document_name)
+        for source_name, destination_name in LEGAL_DOCUMENTS:
+            destination = staged_source / destination_name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / source_name, destination)
 
         staged_corresponding_source = temp_root / "FT-DataUpload-source"
         for file_path, relative in source_files:
@@ -256,29 +330,33 @@ def create_release_archive(
     source_checksum = sha256_file(source_archive_path)
     timestamp = generated_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     metadata = {
-        "schemaVersion": 2,
+        "schemaVersion": "internal-1",
         "version": version,
-        "binary": {
+        "portable": {
             "fileName": archive_path.name,
             "sizeBytes": archive_path.stat().st_size,
             "sha256": checksum,
         },
-        "source": {
+        "privateBuildSource": {
             "fileName": source_archive_path.name,
             "sizeBytes": source_archive_path.stat().st_size,
             "sha256": source_checksum,
         },
         "generatedAt": timestamp,
     }
-    metadata_path.write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    checksum_path.write_text(f"{checksum}  {archive_path.name}\n", encoding="utf-8")
-    source_checksum_path.write_text(
-        f"{source_checksum}  {source_archive_path.name}\n",
-        encoding="utf-8",
-    )
+    if emit_metadata:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix=".release-info-", suffix=".tmp",
+            dir=output_dir, delete=False,
+        ) as stream:
+            temporary_metadata = Path(stream.name)
+            stream.write(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
+        try:
+            os.replace(temporary_metadata, metadata_path)
+        finally:
+            temporary_metadata.unlink(missing_ok=True)
+    write_text_lf(checksum_path, f"{checksum}  {archive_path.name}\n")
+    write_text_lf(source_checksum_path, f"{source_checksum}  {source_archive_path.name}\n")
     return (
         archive_path,
         source_archive_path,
@@ -338,10 +416,10 @@ def main() -> int:
     )
     print(f"Release v{info['version']} ready")
     print(f"Package:  {archive}")
-    print(f"Source:   {source_archive}")
-    print(f"Metadata: {metadata}")
+    print(f"Private build source: {source_archive}")
+    print(f"Private audit info:   {metadata}")
     print(f"Checksum: {checksum}")
-    print(f"Source checksum: {source_checksum}")
+    print(f"Private source checksum: {source_checksum}")
     return 0
 
 

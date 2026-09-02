@@ -18,7 +18,7 @@ DEVICE_ID = "123e4567-e89b-42d3-a456-426614174000"
 
 
 def test_release_version_matches_backend_gate():
-    assert APP_VERSION == "1.5.0"
+    assert APP_VERSION == "2.0.0"
 
 
 def test_upload_gate_requires_scm_id_and_explicit_consent():

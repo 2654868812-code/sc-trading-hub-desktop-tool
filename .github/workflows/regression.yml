@@ -33,6 +33,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Qt runtime used by the UI smoke test
+        run: python -m pip install PySide6-Essentials==6.11.2
+
+      - name: Test PySide6 UI startup
+        run: python test_qt_migration.py
+
       - name: Test history persistence
         run: python test_history.py
 

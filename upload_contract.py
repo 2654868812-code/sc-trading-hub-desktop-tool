@@ -2,7 +2,7 @@
 
 import re
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "2.0.0"
 PRIVACY_POLICY_VERSION = "2026-08-28"
 _DEVICE_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",

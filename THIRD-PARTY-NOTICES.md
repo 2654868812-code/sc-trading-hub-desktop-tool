@@ -1,12 +1,20 @@
 # Third-Party Notices
 
-FT-DataUpload is licensed under GNU GPL version 3. The full text is in
-`COPYING`. The release also contains the following direct dependencies and
-model assets. Their copyright notices and license files remain applicable.
+FT-DataUpload uses PySide6 and Qt under the GNU Lesser General Public License
+version 3. The LGPLv3 text is in `COPYING.LESSER`; the GPLv3 text incorporated
+by that license is in `COPYING`. These texts apply to the LGPL-covered Qt and
+PySide6 libraries. The Fantian Trading Hub Desktop Assistant application code
+is proprietary and is not licensed by those texts.
+Exact upstream source locations and instructions for replacing the dynamically
+loaded libraries are in `QT-LGPL-SOURCE.md`. Keep local copies of those source
+archives with every public binary release.
+
+The release also contains the following direct dependencies and model assets.
+Their copyright notices and license files remain applicable.
 
 | Component | Release baseline | License | Project/source |
 | --- | --- | --- | --- |
-| PyQt6 | 6.11.0 | GPL-3.0-only | https://www.riverbankcomputing.com/software/pyqt/ |
+| PySide6 Essentials / Qt | 6.11.2 | LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only | https://doc.qt.io/qtforpython-6/ |
 | Requests | 2.34.2 | Apache-2.0 | https://requests.readthedocs.io/ |
 | PyInstaller | 6.21.0 | GPL-2.0-or-later with bootloader exception | https://pyinstaller.org/ |
 | Pillow | 11.3.0 | MIT-CMU | https://python-pillow.org/ |
